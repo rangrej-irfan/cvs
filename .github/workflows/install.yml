@@ -83,7 +83,7 @@ jobs:
           # 2. Mounted Kubernetes secret volume (common path: /etc/gcp-secrets)
           # 3. Runner's home directory
           # 4. Environment variable path (if set)
-          
+          GCP_KEY_FILE: ${{ secrets.GCP_KEY_FILE }}
           GCP_KEY_FILE=""
           
           # Try workspace first
