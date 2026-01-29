@@ -66,11 +66,9 @@ jobs:
           fi
 
       - name: Authenticate to GCP
-        env:
-         GCP_KEY_FILE: ${{ secrets.GCP_KEY_FILE }}
-        run: |
-         echo "$GCP_KEY_FILE" > /tmp/gcp-key.json
-         gcloud auth activate-service-account --key-file=/tmp/gcp-key.json
+        uses: google-github-actions/auth@v2
+        with:
+         credentials_json: '${{ secrets.GCP_KEY_FILE }}'
 
       - name: Load configuration from variables.env
         run: |
