@@ -1,0 +1,18 @@
+#This file enables privacera installation for Google cloud (GCP).
+#Note: Please update all mandatory fields. Search for <PLEASE_CHANGE>
+
+
+DISCOVERY_FS_PREFIX: "gs://"
+
+## Provide GCP Project ID Below
+PROJECT_ID: "forward-camera-186122"
+
+###############################################
+##### BELOW VARIABLE SHOULD NOT BE CHANGED ####
+###############################################
+
+### Enables Installation for Google Cloud
+CLOUD_SERVICE: "gcp"
+K8S_PROVIDER: "gcp"
+
+###############################################
