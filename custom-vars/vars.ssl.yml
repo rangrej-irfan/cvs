@@ -1,0 +1,125 @@
+#This file enables SSL in Privacera
+#Note: Please update all mandatory fields. Search for <PLEASE_CHANGE>
+
+### Enable Self Signed Certs, Change the value to "false" to use CA Signed Certs.
+SSL_SELF_SIGNED: "true"
+
+### By Default SSL Certs password is set to "changeit" when SSL_SELF_SIGNED is enabled. Uncomment and Update the Value to use a different password.
+#SSL_DEFAULT_PASSWORD: "<PLEASE_CHANGE>"
+
+############################### To Configure CA Signed Certs for all the Services ############################
+### When SSL_SELF_SIGNED is set "false", Uncomment and Provide File Names and Make sure {{SSL_SIGNED_PEM_FULL_CHAIN}} and {{SSL_SIGNED_PEM_PRIVATE_KEY}} are copied in config/ssl folder
+#SSL_SIGNED_PEM_FULL_CHAIN: "ssl_cert_full_chain.pem"
+#SSL_SIGNED_PEM_PRIVATE_KEY: "ssl_cert_private_key.pem"
+
+### When SSL_SELF_SIGNED is set "false", Uncomment and Provide CA Cert File Format. Supported formats are  pem, pkcs12. Default is set to pkcs12
+#SSL_SIGNED_CERT_FORMAT: "pem"
+
+######################################## To Configure CA Signed Certs for Each Service #########################
+### If the CA Signed Certs have hostnames for each service or there is a need to configure certs for each service, Uncomment and Update below Variables Only if the respective services are enabled.
+### NOTE:- Make sure Certs and private key files are placed under config/ssl folder with similar names.
+
+### PORTAL ###
+#PRIVACERA_PORTAL_SSL_SIGNED_PEM_FULL_CHAIN: "portal_fullchain.pem"
+#PRIVACERA_PORTAL_SSL_SIGNED_PEM_PRIVATE_KEY: "portal_private_key.pem"
+
+### RANGER ###
+#RANGER_ADMIN_SSL_SIGNED_PEM_FULL_CHAIN: "ranger_fullchain.pem"
+#RANGER_ADMIN_SSL_SIGNED_PEM_PRIVATE_KEY: "ranger_private_key.pem"
+
+### DATASERVER ###
+#DATASERVER_SSL_SIGNED_PEM_FULL_CHAIN: "dataserver_fullchain.pem"
+#DATASERVER_SSL_SIGNED_PEM_PRIVATE_KEY: "dataserver_private_key.pem"
+
+### SCHEME SERVER ###
+#SCHEME_SERVER_SSL_SIGNED_PEM_FULL_CHAIN: "scheme_fullchain.pem"
+#SCHEME_SERVER_SSL_SIGNED_PEM_PRIVATE_KEY: "scheme_private_key.pem"
+
+### PEG ###
+#PEG_V2_SSL_SIGNED_PEM_FULL_CHAIN: "peg_fullchain.pem"
+#PEG_V2_SSL_SIGNED_PEM_PRIVATE_KEY: "peg_private_key.pem"
+
+### AUDITSERVER ###
+#AUDITSERVER_SSL_SIGNED_PEM_FULL_CHAIN: "auditserver_fullchain.pem"
+#AUDITSERVER_SSL_SIGNED_PEM_PRIVATE_KEY: "auditserver_private_key.pem"
+
+### PRIVACERA-DIAGNOSTICS ###
+#DIAG_SERVER_SSL_SIGNED_PEM_FULL_CHAIN: "diagnostics_fullchain.pem"
+#DIAG_SERVER_SSL_SIGNED_PEM_PRIVATE_KEY: "diagnostics_private_key.pem"
+
+### PRIVACERA USERSYNC ###
+#PRIVACERA_USERSYNC_SSL_SIGNED_PEM_FULL_CHAIN: "privacera-usersync_fullchain.pem"
+#PRIVACERA_USERSYNC_SSL_SIGNED_PEM_PRIVATE_KEY: "privacera-usersync_private_key.pem"
+
+### GRAFANA ###
+#GRAFANA_SSL_SIGNED_PEM_FULL_CHAIN: "grafana_fullchain.pem"
+#GRAFANA_SSL_SIGNED_PEM_PRIVATE_KEY: "grafana_private_key.pem"
+
+### OTEL COLLECTOR ###
+#OTEL_COLLECTOR_SSL_SIGNED_PEM_FULL_CHAIN: "otel-collector_fullchain.pem"
+#OTEL_COLLECTOR_SSL_SIGNED_PEM_PRIVATE_KEY: "otel-collector_private_key.pem"
+
+### Ensure SOLR is always self-signed ###
+SOLR_SSL_SELF_SIGNED: "true"
+SOLR_SSL_SIGNED_CERT_FORMAT: "pkcs12"
+
+############################################ ADVANCED/OPTIONAL CONFIGS #############################################
+#below are few other properties for each service that may be required to configure
+
+### PORTAL ###
+#PORTAL_SSL_SELF_SIGNED: "{{SSL_SELF_SIGNED}}"
+#PRIVACERA_PORTAL_KEYSTORE_ALIAS: "<PLEASE_CHANGE>"
+#PRIVACERA_PORTAL_KEYSTORE_PASSWORD: "<PLEASE_CHANGE>"
+#PRIVACERA_PORTAL_TRUSTSTORE_PASSWORD: "<PLEASE_CHANGE>"
+
+### RANGER ###
+#RANGER_SSL_SELF_SIGNED: "{{SSL_SELF_SIGNED}}"
+#RANGER_ADMIN_KEYSTORE_ALIAS: "<PLEASE_CHANGE>"
+#RANGER_ADMIN_KEYSTORE_PASSWORD: "<PLEASE_CHANGE>"
+#RANGER_ADMIN_TRUSTSTORE_PASSWORD: "<PLEASE_CHANGE>"
+
+### DATASERVER ###
+#DATASERVER_SSL_SELF_SIGNED: "{{SSL_SELF_SIGNED}}"
+#DATASERVER_SSL_TRUSTSTORE_PASSWORD: "<PLEASE_CHANGE>"
+#DATASERVER_SSL_SELF_SIGNED: "<PLEASE_CHANGE>"
+#DATASERVER_HOST_NAME: "<PLEASE_CHANGE>"
+#DATASERVER_SSL_SIGNED_CERT_FORMAT: "<PLEASE_CHANGE>"
+
+### PRIVACERA USERSYNC ###
+#PRIVACERA_USERSYNC_SSL_SELF_SIGNED: "{{SSL_SELF_SIGNED}}"
+#PRIVACERA_USERSYNC_KEYSTORE_ALIAS: "<PLEASE_CHANGE>"
+#PRIVACERA_USERSYNC_KEYSTORE_PASSWORD: "<PLEASE_CHANGE>"
+
+### RANGER USERSYNC ###
+#USERSYNC_AUTH_SSL_TRUSTSTORE_PASSWORD: "<PLEASE_CHANGE>"
+
+### RANGER KMS ###
+#RANGER_KMS_KEYSTORE_ALIAS: "<PLEASE_CHANGE>"
+#RANGER_KMS_KEYSTORE_PASSWORD: "<PLEASE_CHANGE>"
+#RANGER_KMS_TRUSTSTORE_PASSWORD: "<PLEASE_CHANGE>"
+
+### SCHEME SERVER ###
+#SCHEME_SERVER_SSL_SELF_SIGNED: "{{SSL_SELF_SIGNED}}"
+#SCHEME_SERVER_KEYSTORE_ALIAS: "<PLEASE_CHANGE>"
+#SCHEME_SERVER_KEYSTORE_PASSWORD: "<PLEASE_CHANGE>"
+#SCHEME_SERVER_TRUSTSTORE_PASSWORD: "<PLEASE_CHANGE>"
+
+### PEG ###
+#PEG_V2_SSL_SELF_SIGNED: "{{SSL_SELF_SIGNED}}"
+#PEG_V2_KEYSTORE_ALIAS: "<PLEASE_CHANGE>"
+#PEG_V2_KEYSTORE_PASSWORD: "<PLEASE_CHANGE>"
+#PEG_V2_TRUSTSTORE_PASSWORD: "<PLEASE_CHANGE>"
+
+### Uncomment and Update password for Ranger Plugin(Used by Ranger Clients Internally), By Default it is set to use SSL_DEFAULT_PASSWORD. ###
+#RANGER_PLUGIN_SSL_SELF_SIGNED: "{{SSL_SELF_SIGNED}}"
+#RANGER_PLUGIN_SSL_KEYSTORE_PASSWORD: "<PLEASE_CHANGE>"
+#RANGER_PLUGIN_SSL_TRUSTSTORE_PASSWORD: "<PLEASE_CHANGE>"
+
+###############################################
+##### BELOW VARIABLE SHOULD NOT BE CHANGED ####
+###############################################
+
+### Enable SSL
+ENABLE_SSL: "true"
+
+###############################################

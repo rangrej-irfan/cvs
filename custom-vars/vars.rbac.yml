@@ -1,0 +1,2 @@
+ROLE_BINDING_API_VERSION: "rbac.authorization.k8s.io/v1"
+POD_DISRUPTION_BUDGET_API_VERSION: "policy/v1"

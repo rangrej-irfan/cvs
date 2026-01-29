@@ -1,0 +1,3 @@
+K8S_SERVICE_ACCOUNT: "privacera-sa"
+K8S_ROLE_NAME: "privacera-sa-role"
+K8S_ROLE_BINDING_NAME: "privacera-sa-role-bind"
