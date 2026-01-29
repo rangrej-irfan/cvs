@@ -33,7 +33,7 @@ env:
 jobs:
   install:
     name: Install Privacera Manager
-    runs-on: [self-hosted, k8s, linux]  # Use exact labels from working repository
+    runs-on: self-hosted  # Use exact labels from working repository
     
     # Use secrets for sensitive data - moved to step-level to reduce evaluation context
     # Configuration loaded from variables.env
