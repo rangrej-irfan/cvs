@@ -69,7 +69,7 @@ jobs:
         env:
          GCP_KEY_FILE: ${{ secrets.GCP_KEY_FILE }}
         run: |
-         echo "$GCP_KEY_FILE" | base64 --decode > /tmp/gcp-key.json
+         echo "$GCP_KEY_FILE" > /tmp/gcp-key.json
          gcloud auth activate-service-account --key-file=/tmp/gcp-key.json
 
       - name: Load configuration from variables.env
