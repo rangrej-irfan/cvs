@@ -1,0 +1,23 @@
+apiVersion: actions.summerwind.dev/v1alpha1
+kind: RunnerDeployment
+metadata:
+  name: privacera-manager-deploy
+  namespace: actions-runner-system
+spec:
+  replicas: 1
+  template:
+    spec:
+      repository: YOUR_USERNAME/YOUR_REPOSITORY
+      labels:
+        - self-hosted
+        - k8s  
+        - linux
+      resources:
+        limits:
+          memory: "2Gi"
+          cpu: "1000m"
+        requests:
+          memory: "1Gi"
+          cpu: "500m"
+      dockerdWithinRunnerContainer: false
+      image: summerwind/actions-runner:latest
