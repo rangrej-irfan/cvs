@@ -52,6 +52,30 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+      
+      - name: Cleanup previous run artifacts
+        run: |
+          echo "🧹 Cleaning up previous run artifacts..."
+          
+          # Remove privacera-manager directory with elevated permissions if needed
+          if [ -d "${GITHUB_WORKSPACE}/privacera-manager" ]; then
+            sudo rm -rf "${GITHUB_WORKSPACE}/privacera-manager" 2>/dev/null || rm -rf "${GITHUB_WORKSPACE}/privacera-manager"
+          fi
+          
+          # Clean up home directory privacera folder
+          if [ -d "${HOME}/privacera" ]; then
+            sudo rm -rf "${HOME}/privacera" 2>/dev/null || rm -rf "${HOME}/privacera"
+          fi
+          
+          # Clean up any other artifacts from previous runs
+          sudo rm -rf "${GITHUB_WORKSPACE}/helm-charts-output" 2>/dev/null || true
+          sudo rm -rf "${GITHUB_WORKSPACE}/portal-ips.txt" 2>/dev/null || true
+          
+          # Fix ownership of workspace if needed
+          sudo chown -R $(whoami):$(whoami) "${GITHUB_WORKSPACE}" 2>/dev/null || true
+          
+          echo "✅ Cleanup complete"
+
 
       - name: Check workflow_dispatch event
         run: |
