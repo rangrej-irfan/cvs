@@ -193,43 +193,87 @@ jobs:
           # Check if secret is set
           if [ -z "${GCP_SERVICE_ACCOUNT_KEY}" ]; then
             echo "❌ ERROR: GCP_SERVICE_ACCOUNT_KEY secret is not set"
-            echo ""
-            echo "Please create a GitHub secret named 'GCP_SERVICE_ACCOUNT_KEY' containing"
-            echo "your GCP service account JSON key (the entire JSON content in one line)."
-            echo ""
-            echo "Steps:"
-            echo "  1. Go to repository Settings → Secrets and variables → Actions"
-            echo "  2. Click 'New repository secret'"
-            echo "  3. Name: GCP_SERVICE_ACCOUNT_KEY"
-            echo "  4. Value: Paste your entire service account JSON (can be one line or multi-line)"
-            echo "  5. Click 'Add secret'"
             exit 1
           fi
           
-          # Write the secret to a temporary file
           GCP_KEY_FILE="${RUNNER_TEMP}/gcp-service-account-key.json"
-          echo "${GCP_SERVICE_ACCOUNT_KEY}" > "${GCP_KEY_FILE}"
+          
+          # Try to detect if the secret is base64-encoded or raw JSON
+          # Base64 strings don't start with '{' and can be decoded
+          if echo "${GCP_SERVICE_ACCOUNT_KEY}" | head -c1 | grep -q '{'; then
+            echo "📄 Detected raw JSON format"
+            # Raw JSON - write directly
+            echo "${GCP_SERVICE_ACCOUNT_KEY}" > "${GCP_KEY_FILE}"
+          else
+            echo "📄 Detected base64-encoded format"
+            # Base64 encoded - decode it
+            echo "${GCP_SERVICE_ACCOUNT_KEY}" | base64 -d > "${GCP_KEY_FILE}" 2>/dev/null || {
+              echo "⚠️ Base64 decode failed, trying as raw JSON..."
+              echo "${GCP_SERVICE_ACCOUNT_KEY}" > "${GCP_KEY_FILE}"
+            }
+          fi
+          
           chmod 600 "${GCP_KEY_FILE}"
           
           # Validate JSON format
           if ! python3 -m json.tool "${GCP_KEY_FILE}" > /dev/null 2>&1; then
-            echo "❌ ERROR: Invalid JSON format in GCP_SERVICE_ACCOUNT_KEY secret"
+            echo "❌ ERROR: Invalid JSON in service account key"
             echo ""
-            echo "The secret must contain valid JSON. Common issues:"
-            echo "  - Missing quotes around keys or values"
-            echo "  - Escaped characters not properly handled"
-            echo "  - Truncated content"
+            echo "🔧 RECOMMENDED FIX: Use base64 encoding for your secret"
             echo ""
-            echo "Tip: Copy the entire contents of your service account JSON file"
+            echo "On your local machine, run:"
+            echo "  base64 -w 0 < your-service-account-key.json"
+            echo ""
+            echo "Then update the GCP_SERVICE_ACCOUNT_KEY secret with that base64 output."
+            echo ""
+            echo "--- Debug Info ---"
+            echo "First 100 chars of decoded content:"
+            head -c 100 "${GCP_KEY_FILE}" | cat -v
+            echo ""
+            echo "---"
+            rm -f "${GCP_KEY_FILE}"
+            exit 1
+          fi
+          
+          # Verify the private_key field exists and looks valid
+          if ! python3 -c "
+          import json
+          import sys
+          with open('${GCP_KEY_FILE}') as f:
+              data = json.load(f)
+          pk = data.get('private_key', '')
+          if not pk:
+              print('ERROR: private_key field is missing')
+              sys.exit(1)
+          if '-----BEGIN' not in pk:
+              print('ERROR: private_key does not contain valid PEM header')
+              sys.exit(1)
+          print('OK: private_key field looks valid')
+          "; then
+            echo "❌ ERROR: The private_key in your JSON appears to be corrupted"
+            echo ""
+            echo "This usually happens when:"
+            echo "  1. Newlines in the private_key were lost during copy/paste"
+            echo "  2. The JSON was improperly escaped"
+            echo ""
+            echo "🔧 SOLUTION: Re-create your secret using base64 encoding:"
+            echo ""
+            echo "  # On Mac/Linux:"
+            echo "  base64 -w 0 < your-service-account-key.json"
+            echo ""
+            echo "  # On Mac (if -w not supported):"
+            echo "  base64 -i your-service-account-key.json | tr -d '\\n'"
+            echo ""
+            echo "Then paste that base64 string as your GCP_SERVICE_ACCOUNT_KEY secret."
             rm -f "${GCP_KEY_FILE}"
             exit 1
           fi
           
           echo "✅ Service account key JSON is valid"
           
-          # Extract and display service account email (for verification, not sensitive)
-          SA_EMAIL=$(python3 -c "import json; print(json.load(open('${GCP_KEY_FILE}')).get('client_email', 'unknown'))" 2>/dev/null || echo "unknown")
-          SA_PROJECT=$(python3 -c "import json; print(json.load(open('${GCP_KEY_FILE}')).get('project_id', 'unknown'))" 2>/dev/null || echo "unknown")
+          # Extract info for verification
+          SA_EMAIL=$(python3 -c "import json; print(json.load(open('${GCP_KEY_FILE}')).get('client_email', 'unknown'))")
+          SA_PROJECT=$(python3 -c "import json; print(json.load(open('${GCP_KEY_FILE}')).get('project_id', 'unknown'))")
           echo "📧 Service Account: ${SA_EMAIL}"
           echo "📁 Project from key: ${SA_PROJECT}"
           
@@ -237,38 +281,23 @@ jobs:
           echo "🔑 Activating service account..."
           if ! gcloud auth activate-service-account --key-file="${GCP_KEY_FILE}" 2>&1; then
             echo "❌ ERROR: Failed to activate service account"
-            echo ""
-            echo "Possible causes:"
-            echo "  - Service account key has been revoked or deleted"
-            echo "  - Service account is disabled"
-            echo "  - Key file is corrupted"
             rm -f "${GCP_KEY_FILE}"
             exit 1
           fi
           
           echo "✅ Service account activated successfully"
           
-          # Set the project (use input if provided, otherwise use project from key)
+          # Set the project
           TARGET_PROJECT="${GCP_PROJECT_ID:-${SA_PROJECT}}"
           gcloud config set project "${TARGET_PROJECT}"
           echo "✅ GCP project set to: ${TARGET_PROJECT}"
           
           # Verify authentication
-          echo ""
-          echo "🔍 Verifying authentication..."
-          ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null)
-          if [ -n "${ACTIVE_ACCOUNT}" ]; then
-            echo "✅ Authenticated as: ${ACTIVE_ACCOUNT}"
-          else
-            echo "❌ ERROR: Authentication verification failed"
-            rm -f "${GCP_KEY_FILE}"
-            exit 1
-          fi
+          ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format='value(account)')
+          echo "✅ Authenticated as: ${ACTIVE_ACCOUNT}"
           
           # Store the key file path for subsequent steps
           echo "GCP_KEY_FILE=${GCP_KEY_FILE}" >> $GITHUB_ENV
-          
-          echo ""
           echo "✅ GCP authentication completed successfully"
 
       - name: Load configuration from variables.env
