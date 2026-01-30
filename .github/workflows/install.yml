@@ -33,7 +33,7 @@ env:
 jobs:
   install:
     name: Install Privacera Manager
-    runs-on: [self-hosted, k8s, linux]
+    runs-on: self-hosted
     
     env:
       PRIVACERA_VERSION: ""
