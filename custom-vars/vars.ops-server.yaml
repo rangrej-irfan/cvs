@@ -1,0 +1,30 @@
+#This file enables OPS Server Installation & contains variables to configure OPS Server.
+# Its common server for privacera
+
+### Enables Ops Server Installation
+OPS_SERVER_ENABLE: "true"
+#Below properties are only for Kubernetes
+OPS_SERVER_REPLICAS_MIN: "1"
+OPS_SERVER_REPLICAS_MAX: "1"
+
+### Ops Server SQS Configuration
+#OPS_SERVER_SQS_LISTENER_ENABLE: "false"
+#OPS_SERVER_SQS_REGION: ""
+#OPS_SERVER_SQS_QUEUE_NAME: ""
+
+######## Properties to Enable Pod Level IAM Role for Ops-server ############
+#These properties are only applicable for AWS K8s env. i.e. when K8S_PROVIDER ='aws'
+
+### Enables creation of an IAM role that will be specifically used for ops-server Pod.
+#OPS_SERVER_USE_POD_IAM_ROLE: "true"
+
+### Full IAM role ARN associated with the ops-server pod. This needs to be an existing one. e.g. "arn:aws:iam::aws:role/AmazonS3Access"
+#OPS_SERVER_IAM_ROLE_ARN: "<PLEASE_CHANGE>"
+
+
+## Flag to enable to encryption for sensitive property using shared secret .
+#OPS_SERVER_SHARED_SECRET_ENABLED: "true"
+#OPS_SERVER_SHARED_SECRET: "<PLEASE_CHANGE>"
+
+#Limit the number of version history records for specific connector
+OPS_SERVER_CONNECTOR_VERSION_HISTORY_RECORDS_LIMIT: "100"
