@@ -33,21 +33,17 @@ env:
 jobs:
   install:
     name: Install Privacera Manager
-    runs-on: self-hosted  # Use exact labels from working repository
+    runs-on: [self-hosted, k8s, linux]
     
-    # Use secrets for sensitive data - moved to step-level to reduce evaluation context
-    # Configuration loaded from variables.env
     env:
       PRIVACERA_VERSION: ""
       PRIVACERA_HUB_SERVER: ""
       DEPLOYMENT_ENV_NAME: ""
-      # Manual pipeline variables  
       GCP_PROJECT_ID: ${{ github.event.inputs.gcp_project_id }}
       GCP_REGION: ${{ github.event.inputs.gcp_region }}
       GKE_CLUSTER_NAME: ${{ github.event.inputs.gke_cluster_name }}
       SKIP_HELM_VALIDATION: ${{ github.event.inputs.skip_helm_validation }}
       DEBUG_MODE: ${{ github.event.inputs.debug_mode }}
-      # Derived variables (set after loading variables.env)
       PRIV_MGR_IMAGE: ""
       PRIV_MGR_PACKAGE: ""
 
@@ -61,235 +57,283 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
             echo "❌ ERROR: This workflow can only be run via workflow_dispatch"
-            echo "   Please go to Actions tab → Click 'Run workflow' → Select branch 'cvs'"
+            echo "   Please go to Actions tab → Click 'Run workflow' → Select branch"
             exit 1
           fi
 
+      - name: Install prerequisites
+        run: |
+          echo "📦 Installing prerequisites..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl tar gzip wget openssl hostname sudo unzip python3 python3-pip apt-transport-https ca-certificates gnupg
+          
+          # Install Google Cloud SDK
+          echo "☁️ Installing Google Cloud SDK..."
+          if ! command -v gcloud &> /dev/null; then
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+            sudo apt-get update -qq && sudo apt-get install -y -qq google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin
+          else
+            echo "✅ gcloud already installed"
+          fi
+          
+          gcloud --version
+          
+          # Install kubectl
+          echo "🔧 Installing kubectl..."
+          if ! command -v kubectl &> /dev/null; then
+            KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
+            curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            sudo mv kubectl /usr/local/bin/
+          else
+            echo "✅ kubectl already installed"
+          fi
+          kubectl version --client
+          
+          # Verify gke-gcloud-auth-plugin
+          if command -v gke-gcloud-auth-plugin &> /dev/null; then
+            echo "✅ gke-gcloud-auth-plugin available at: $(which gke-gcloud-auth-plugin)"
+          else
+            echo "⚠️ gke-gcloud-auth-plugin not in PATH, checking alternative locations..."
+            for path in /usr/bin/gke-gcloud-auth-plugin /usr/local/bin/gke-gcloud-auth-plugin; do
+              if [ -x "$path" ]; then
+                echo "✅ Found at: $path"
+                break
+              fi
+            done
+          fi
+          
+          # Install Helm
+          echo "⎈ Installing Helm..."
+          if ! command -v helm &> /dev/null; then
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          else
+            echo "✅ Helm already installed"
+          fi
+          helm version
+          
+          # Install Ansible
+          pip3 install --break-system-packages ansible-core>=2.12.0 PyYAML 2>/dev/null || pip3 install ansible-core>=2.12.0 PyYAML
+          
+          echo "✅ All prerequisites installed"
+
       - name: Authenticate to GCP
-        uses: google-github-actions/auth@v2
-        with:
-         credentials_json: '${{ secrets.GCP_KEY_FILE }}'
+        env:
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+        run: |
+          echo "🔐 Authenticating to GCP..."
+          
+          # Check if secret is set
+          if [ -z "${GCP_SERVICE_ACCOUNT_KEY}" ]; then
+            echo "❌ ERROR: GCP_SERVICE_ACCOUNT_KEY secret is not set"
+            echo ""
+            echo "Please create a GitHub secret named 'GCP_SERVICE_ACCOUNT_KEY' containing"
+            echo "your GCP service account JSON key (the entire JSON content in one line)."
+            echo ""
+            echo "Steps:"
+            echo "  1. Go to repository Settings → Secrets and variables → Actions"
+            echo "  2. Click 'New repository secret'"
+            echo "  3. Name: GCP_SERVICE_ACCOUNT_KEY"
+            echo "  4. Value: Paste your entire service account JSON (can be one line or multi-line)"
+            echo "  5. Click 'Add secret'"
+            exit 1
+          fi
+          
+          # Write the secret to a temporary file
+          GCP_KEY_FILE="${RUNNER_TEMP}/gcp-service-account-key.json"
+          echo "${GCP_SERVICE_ACCOUNT_KEY}" > "${GCP_KEY_FILE}"
+          chmod 600 "${GCP_KEY_FILE}"
+          
+          # Validate JSON format
+          if ! python3 -m json.tool "${GCP_KEY_FILE}" > /dev/null 2>&1; then
+            echo "❌ ERROR: Invalid JSON format in GCP_SERVICE_ACCOUNT_KEY secret"
+            echo ""
+            echo "The secret must contain valid JSON. Common issues:"
+            echo "  - Missing quotes around keys or values"
+            echo "  - Escaped characters not properly handled"
+            echo "  - Truncated content"
+            echo ""
+            echo "Tip: Copy the entire contents of your service account JSON file"
+            rm -f "${GCP_KEY_FILE}"
+            exit 1
+          fi
+          
+          echo "✅ Service account key JSON is valid"
+          
+          # Extract and display service account email (for verification, not sensitive)
+          SA_EMAIL=$(python3 -c "import json; print(json.load(open('${GCP_KEY_FILE}')).get('client_email', 'unknown'))" 2>/dev/null || echo "unknown")
+          SA_PROJECT=$(python3 -c "import json; print(json.load(open('${GCP_KEY_FILE}')).get('project_id', 'unknown'))" 2>/dev/null || echo "unknown")
+          echo "📧 Service Account: ${SA_EMAIL}"
+          echo "📁 Project from key: ${SA_PROJECT}"
+          
+          # Activate service account
+          echo "🔑 Activating service account..."
+          if ! gcloud auth activate-service-account --key-file="${GCP_KEY_FILE}" 2>&1; then
+            echo "❌ ERROR: Failed to activate service account"
+            echo ""
+            echo "Possible causes:"
+            echo "  - Service account key has been revoked or deleted"
+            echo "  - Service account is disabled"
+            echo "  - Key file is corrupted"
+            rm -f "${GCP_KEY_FILE}"
+            exit 1
+          fi
+          
+          echo "✅ Service account activated successfully"
+          
+          # Set the project (use input if provided, otherwise use project from key)
+          TARGET_PROJECT="${GCP_PROJECT_ID:-${SA_PROJECT}}"
+          gcloud config set project "${TARGET_PROJECT}"
+          echo "✅ GCP project set to: ${TARGET_PROJECT}"
+          
+          # Verify authentication
+          echo ""
+          echo "🔍 Verifying authentication..."
+          ACTIVE_ACCOUNT=$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null)
+          if [ -n "${ACTIVE_ACCOUNT}" ]; then
+            echo "✅ Authenticated as: ${ACTIVE_ACCOUNT}"
+          else
+            echo "❌ ERROR: Authentication verification failed"
+            rm -f "${GCP_KEY_FILE}"
+            exit 1
+          fi
+          
+          # Store the key file path for subsequent steps
+          echo "GCP_KEY_FILE=${GCP_KEY_FILE}" >> $GITHUB_ENV
+          
+          echo ""
+          echo "✅ GCP authentication completed successfully"
 
       - name: Load configuration from variables.env
         run: |
           echo "🔧 Loading configuration from variables.env..."
           
-          # Check if variables.env exists
-          if [ -f "variables.env" ]; then
-            echo "✅ Found variables.env file"
-          else
+          if [ ! -f "variables.env" ]; then
             echo "❌ ERROR: variables.env file not found!"
             echo "Please ensure variables.env exists with PRIVACERA_VERSION and PRIVACERA_HUB_SERVER"
             exit 1
           fi
           
-          # Source the variables.env file
+          echo "✅ Found variables.env file"
           source variables.env
           
           # Set deployment environment name (defaults to branch name)
           DEPLOYMENT_ENV_NAME="${DEPLOYMENT_ENV_NAME:-${{ github.ref_name }}}"
           
           # Export variables for subsequent steps
-          echo "PRIVACERA_VERSION=$PRIVACERA_VERSION" >> $GITHUB_ENV
-          echo "PRIVACERA_HUB_SERVER=$PRIVACERA_HUB_SERVER" >> $GITHUB_ENV
-          echo "DEPLOYMENT_ENV_NAME=$DEPLOYMENT_ENV_NAME" >> $GITHUB_ENV
-          echo "PRIV_MGR_IMAGE=$PRIVACERA_HUB_SERVER/privacera-manager:$PRIVACERA_VERSION" >> $GITHUB_ENV
-          echo "PRIV_MGR_PACKAGE=https://privacera-releases.s3.us-east-1.amazonaws.com/privacera-manager/$PRIVACERA_VERSION/privacera-manager.tar.gz" >> $GITHUB_ENV
+          {
+            echo "PRIVACERA_VERSION=${PRIVACERA_VERSION}"
+            echo "PRIVACERA_HUB_SERVER=${PRIVACERA_HUB_SERVER}"
+            echo "DEPLOYMENT_ENV_NAME=${DEPLOYMENT_ENV_NAME}"
+            echo "PRIV_MGR_IMAGE=${PRIVACERA_HUB_SERVER}/privacera-manager:${PRIVACERA_VERSION}"
+            echo "PRIV_MGR_PACKAGE=https://privacera-releases.s3.us-east-1.amazonaws.com/privacera-manager/${PRIVACERA_VERSION}/privacera-manager.tar.gz"
+          } >> $GITHUB_ENV
           
-          echo "✅ Configuration loaded successfully"
-          echo "   - PRIVACERA_VERSION: $PRIVACERA_VERSION"
-          echo "   - PRIVACERA_HUB_SERVER: $PRIVACERA_HUB_SERVER"
-          echo "   - DEPLOYMENT_ENV_NAME: $DEPLOYMENT_ENV_NAME"
-          echo "   - PRIV_MGR_IMAGE: $PRIVACERA_HUB_SERVER/privacera-manager:$PRIVACERA_VERSION"
+          echo "✅ Configuration loaded:"
+          echo "   - PRIVACERA_VERSION: ${PRIVACERA_VERSION}"
+          echo "   - PRIVACERA_HUB_SERVER: ${PRIVACERA_HUB_SERVER}"
+          echo "   - DEPLOYMENT_ENV_NAME: ${DEPLOYMENT_ENV_NAME}"
 
       - name: Validate configuration
-        run: |
-          echo "Validating configuration for Privacera Manager installation..."
-          
-          if [ -z "$PRIVACERA_VERSION" ]; then
-            echo "❌ ERROR: PRIVACERA_VERSION is not set in variables.env"
-            exit 1
-          fi
-          
-          if [ -z "$PRIVACERA_HUB_SERVER" ]; then
-            echo "❌ ERROR: PRIVACERA_HUB_SERVER is not set in variables.env"
-            exit 1
-          fi
-          
-          if [ -z "$DEPLOYMENT_ENV_NAME" ]; then
-            echo "❌ ERROR: DEPLOYMENT_ENV_NAME could not be determined"
-            exit 1
-          fi
-          
-          echo "✅ All required configuration is set"
-
-      - name: Set up kubeconfig
-        run: |
-          echo "Setting up kubeconfig..."
-          # First try to use existing kubeconfig if available
-          if [ -f "$HOME/.kube/config" ]; then
-            echo "Using existing kubeconfig from $HOME/.kube/config"
-            export KUBECONFIG=$HOME/.kube/config
-          elif [ -f "${GITHUB_WORKSPACE}/kubeconfig" ]; then
-            echo "Using kubeconfig from repository"
-            export KUBECONFIG=${GITHUB_WORKSPACE}/kubeconfig
-          elif [ -n "${{ secrets.KUBECONFIG_B64 }}" ]; then
-            echo "Using kubeconfig from secret..."
-            echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > kubeconfig
-            export KUBECONFIG=$PWD/kubeconfig
-          else
-            echo "No kubeconfig found, will check if kubectl is already configured"
-          fi
-
-      - name: Install kubectl
-        run: |
-          echo "Installing kubectl..."
-          KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)
-          echo "Latest stable kubectl version: ${KUBECTL_VERSION}"
-          curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          chmod +x kubectl
-          sudo mv kubectl /usr/local/bin/
-          echo "kubectl installed successfully"
-          kubectl version --client
-          
-          # Install gke-gcloud-auth-plugin (required for GKE authentication)
-          echo "Installing gke-gcloud-auth-plugin..."
-          # Try apt-get first (works in GitHub Actions where gcloud components is disabled)
-          if ! command -v gke-gcloud-auth-plugin >/dev/null 2>&1; then
-            echo "Installing via apt-get..."
-            sudo apt-get update -qq && sudo apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin || {
-              echo "⚠️  apt-get install failed, trying gcloud components..."
-              # Fallback to gcloud components (may be disabled in some environments)
-              gcloud components install gke-gcloud-auth-plugin --quiet 2>/dev/null || \
-              echo "⚠️  Could not install via gcloud components either"
-            }
-          else
-            echo "✅ gke-gcloud-auth-plugin already installed"
-          fi
-          
-          # Find plugin location after installation
-          PLUGIN_PATH=""
-          for path in \
-            "/usr/bin/gke-gcloud-auth-plugin" \
-            "/usr/local/bin/gke-gcloud-auth-plugin" \
-            "$HOME/.config/gcloud/components/gke-gcloud-auth-plugin/bin/gke-gcloud-auth-plugin" \
-            "$(which gke-gcloud-auth-plugin 2>/dev/null)"; do
-            if [ -f "$path" ] && [ -x "$path" ]; then
-              PLUGIN_PATH="$path"
-              echo "✅ Found plugin at: $PLUGIN_PATH"
-              break
-            fi
-          done
-          
-          # If found in non-standard location, ensure it's accessible
-          if [ -n "$PLUGIN_PATH" ] && [ "$PLUGIN_PATH" != "/usr/local/bin/gke-gcloud-auth-plugin" ] && [ "$PLUGIN_PATH" != "/usr/bin/gke-gcloud-auth-plugin" ]; then
-            sudo mkdir -p /usr/local/bin
-            sudo cp "$PLUGIN_PATH" /usr/local/bin/ 2>/dev/null || true
-            sudo chmod +x /usr/local/bin/gke-gcloud-auth-plugin 2>/dev/null || true
-            PLUGIN_PATH="/usr/local/bin/gke-gcloud-auth-plugin"
-            echo "✅ Copied plugin to: $PLUGIN_PATH"
-          fi
-          
-          # Add plugin directory to PATH for this and subsequent steps
-          if [ -n "$PLUGIN_PATH" ]; then
-            PLUGIN_DIR="$(dirname $PLUGIN_PATH)"
-            echo "$PLUGIN_DIR" >> $GITHUB_PATH
-            export PATH="$PLUGIN_DIR:$PATH"
-          fi
-          
-          # Verify installation
-          if command -v gke-gcloud-auth-plugin >/dev/null 2>&1; then
-            echo "✅ gke-gcloud-auth-plugin available at: $(which gke-gcloud-auth-plugin)"
-          elif [ -n "$PLUGIN_PATH" ] && [ -f "$PLUGIN_PATH" ]; then
-            echo "✅ Plugin installed at: $PLUGIN_PATH (may need PATH update in next steps)"
-          else
-            echo "⚠️  Warning: gke-gcloud-auth-plugin not found, but continuing..."
-            echo "Plugin locations checked:"
-            ls -la /usr/bin/gke-gcloud-auth-plugin 2>/dev/null || echo "  Not in /usr/bin"
-            ls -la /usr/local/bin/gke-gcloud-auth-plugin 2>/dev/null || echo "  Not in /usr/local/bin"
-            ls -la ~/.config/gcloud/components/gke-gcloud-auth-plugin/bin/ 2>/dev/null || echo "  Not in ~/.config/gcloud"
-          fi
-
-      - name: Check current kubectl context
-        run: |
-          echo "Checking kubectl configuration..."
-          # Try different kubeconfig locations
-          if [ -f "$HOME/.kube/config" ]; then
-            export KUBECONFIG=$HOME/.kube/config
-          elif [ -f "${GITHUB_WORKSPACE}/kubeconfig" ]; then
-            export KUBECONFIG=${GITHUB_WORKSPACE}/kubeconfig
-          elif [ -f "$PWD/kubeconfig" ]; then
-            export KUBECONFIG=$PWD/kubeconfig
-          fi
-          
-          echo "Current kubectl context:"
-          kubectl config current-context || echo "No context found, will try default"
-
-      - name: Validate required secrets
         env:
           PRIVACERA_HUB_USER: ${{ secrets.PRIVACERA_HUB_USER }}
           PRIVACERA_HUB_PASSWORD: ${{ secrets.PRIVACERA_HUB_PASSWORD }}
         run: |
-          echo "Validating required secrets..."
-          MISSING_SECRETS=""
+          echo "🔍 Validating configuration..."
+          ERRORS=""
+          
+          # Check environment variables
+          [ -z "$PRIVACERA_VERSION" ] && ERRORS="${ERRORS}\n  - PRIVACERA_VERSION not set in variables.env"
+          [ -z "$PRIVACERA_HUB_SERVER" ] && ERRORS="${ERRORS}\n  - PRIVACERA_HUB_SERVER not set in variables.env"
+          [ -z "$DEPLOYMENT_ENV_NAME" ] && ERRORS="${ERRORS}\n  - DEPLOYMENT_ENV_NAME could not be determined"
+          [ -z "$GCP_PROJECT_ID" ] && ERRORS="${ERRORS}\n  - GCP_PROJECT_ID is required (workflow input)"
+          [ -z "$GCP_REGION" ] && ERRORS="${ERRORS}\n  - GCP_REGION is required (workflow input)"
+          [ -z "$GKE_CLUSTER_NAME" ] && ERRORS="${ERRORS}\n  - GKE_CLUSTER_NAME is required (workflow input)"
+          
+          # Check secrets
+          [ -z "$PRIVACERA_HUB_USER" ] && ERRORS="${ERRORS}\n  - PRIVACERA_HUB_USER secret not set"
+          [ -z "$PRIVACERA_HUB_PASSWORD" ] && ERRORS="${ERRORS}\n  - PRIVACERA_HUB_PASSWORD secret not set"
+          
+          if [ -n "$ERRORS" ]; then
+            echo "❌ ERROR: Configuration validation failed:"
+            echo -e "$ERRORS"
+            exit 1
+          fi
+          
+          echo "✅ All required configuration is valid"
 
-          if [ -z "$PRIVACERA_HUB_USER" ]; then
-            MISSING_SECRETS="${MISSING_SECRETS} PRIVACERA_HUB_USER"
-          fi
-          if [ -z "$PRIVACERA_HUB_PASSWORD" ]; then
-            MISSING_SECRETS="${MISSING_SECRETS} PRIVACERA_HUB_PASSWORD"
-          fi
-          
-          # Validate GCP-specific requirements
-          # Note: GCP_PROJECT_ID, GCP_REGION, and GKE_CLUSTER_NAME are required inputs, validated by GitHub Actions
-          if [ -z "${GCP_PROJECT_ID}" ]; then
-            echo "❌ ERROR: GCP_PROJECT_ID is required"
-            exit 1
-          fi
-          if [ -z "${GCP_REGION}" ]; then
-            echo "❌ ERROR: GCP_REGION is required"
-            exit 1
-          fi
-          
-          if [ -n "${MISSING_SECRETS}" ]; then
-            echo "❌ ERROR: The following required secrets are not set:"
-            for secret in ${MISSING_SECRETS}; do
-              echo "  - ${secret}"
-            done
-            echo ""
-            echo "Please set these secrets in GitHub repository settings → Secrets and variables → Actions"
-            exit 1
-          fi
-          
-          echo "✅ All required secrets are set"
-
-      - name: Load variables from variables.env
+      - name: Setup GKE cluster credentials
         run: |
-          echo "Loading default variables from variables.env..."
-          if [ -f "variables.env" ]; then
-            set -a
-            source variables.env
-            set +a
-            echo "✅ Variables loaded from variables.env"
+          echo "☸️ Setting up GKE cluster credentials..."
+          
+          # Check if kubectl is already configured
+          if kubectl cluster-info --request-timeout=5s &>/dev/null; then
+            echo "✅ kubectl is already configured"
+            kubectl config current-context
           else
-            echo "⚠️ variables.env file not found, using workflow inputs only"
+            echo "🔧 Fetching GKE cluster credentials..."
+            
+            # Detect if location is a zone or region
+            # Zones have format: region-zone (e.g., us-central1-c)
+            # Regions have format: region (e.g., us-central1)
+            case "${GCP_REGION}" in
+              *-[a-z])
+                LOCATION_FLAG="--zone=${GCP_REGION}"
+                echo "📍 Detected zonal cluster: ${GCP_REGION}"
+                ;;
+              *)
+                LOCATION_FLAG="--region=${GCP_REGION}"
+                echo "📍 Detected regional cluster: ${GCP_REGION}"
+                ;;
+            esac
+            
+            # Try internal IP first (recommended for self-hosted runners on GKE)
+            echo "🔗 Attempting to get credentials with internal IP..."
+            if gcloud container clusters get-credentials "${GKE_CLUSTER_NAME}" \
+                ${LOCATION_FLAG} \
+                --project="${GCP_PROJECT_ID}" \
+                --internal-ip 2>&1; then
+              echo "✅ Using internal IP endpoint"
+            else
+              echo "⚠️ Internal IP failed, trying external endpoint..."
+              gcloud container clusters get-credentials "${GKE_CLUSTER_NAME}" \
+                ${LOCATION_FLAG} \
+                --project="${GCP_PROJECT_ID}"
+            fi
           fi
+          
+          # Verify cluster access
+          echo ""
+          echo "🔍 Verifying cluster access..."
+          if kubectl cluster-info --request-timeout=10s; then
+            echo "✅ Cluster is accessible"
+          else
+            echo "❌ ERROR: Cannot access cluster"
+            echo ""
+            echo "Troubleshooting:"
+            echo "  1. Verify the cluster name: ${GKE_CLUSTER_NAME}"
+            echo "  2. Verify the region/zone: ${GCP_REGION}"
+            echo "  3. Check if the cluster is private and requires VPN/bastion"
+            echo "  4. Verify service account has 'container.clusters.get' permission"
+            exit 1
+          fi
+          
+          echo ""
+          echo "📋 Current context: $(kubectl config current-context)"
 
       - name: Display configuration
         run: |
           echo "=== GCP Deployment Configuration ==="
-          echo "Deployment Environment Name: ${DEPLOYMENT_ENV_NAME}"
+          echo "Deployment Environment: ${DEPLOYMENT_ENV_NAME}"
           echo "GCP Project ID: ${GCP_PROJECT_ID}"
-          echo "GCP Region: ${GCP_REGION}"
+          echo "GCP Region/Zone: ${GCP_REGION}"
           echo "GKE Cluster Name: ${GKE_CLUSTER_NAME}"
           echo "Privacera Version: ${PRIVACERA_VERSION}"
           echo "Privacera Hub Server: ${PRIVACERA_HUB_SERVER}"
           echo "Debug Mode: ${DEBUG_MODE}"
           echo "Skip Helm Validation: ${SKIP_HELM_VALIDATION}"
-          echo "Privacera Manager Image: ${PRIV_MGR_IMAGE}"
-          echo "Privacera Manager Package: ${PRIV_MGR_PACKAGE}"
           echo "===================================="
-
 
       - name: Login to Privacera Hub
         uses: docker/login-action@v3
@@ -298,780 +342,159 @@ jobs:
           username: ${{ secrets.PRIVACERA_HUB_USER }}
           password: ${{ secrets.PRIVACERA_HUB_PASSWORD }}
 
-      - name: Install Helm
-        run: |
-          echo "Installing Helm..."
-          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-          chmod 700 get_helm.sh
-          ./get_helm.sh
-          helm version
-
-      - name: Install additional dependencies
-        run: |
-          echo "Installing additional dependencies..."
-          sudo apt-get update
-          sudo apt-get install -y curl tar gzip wget openssl hostname sudo unzip python3 python3-pip
-          
-          # Install Google Cloud SDK
-          echo "Installing Google Cloud SDK..."
-          echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
-          curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key --keyring /usr/share/keyrings/cloud.google.gpg add -
-          sudo apt-get update && sudo apt-get install -y google-cloud-cli
-          gcloud --version
-          
-          # Now authenticate to GCP if key file was found earlier
-          if [ -n "${GCP_KEY_FILE}" ] && [ -f "${GCP_KEY_FILE}" ]; then
-            echo "Authenticating to GCP using service account key from file..."
-            gcloud auth activate-service-account --key-file="${GCP_KEY_FILE}" || {
-              echo "❌ ERROR: Failed to activate service account"
-              echo "Please verify the key file is correct and has not been revoked"
-              exit 1
-            }
-            
-            echo "✅ GCP authentication successful"
-            echo "Account: $(gcloud auth list --filter=status:ACTIVE --format='value(account)')"
-            
-            # Set GCP project
-            PROJECT_ID=$(python3 -c "import json; print(json.load(open('${GCP_KEY_FILE}'))['project_id'])" 2>/dev/null || echo "")
-            if [ -n "$PROJECT_ID" ]; then
-              gcloud config set project "$PROJECT_ID"
-              echo "✅ Set GCP project to: $PROJECT_ID"
-            fi
-          else
-            echo "⚠️  GCP_KEY_FILE not set or file not found, skipping authentication"
-            echo "   This may cause issues in later steps"
-          fi
-          
-          # Install Ansible and PyYAML (needed for kubeconfig updates)
-          pip3 install --break-system-packages ansible-core>=2.12.0 PyYAML
-          ansible --version
-
-      - name: Setup Kubernetes context
-        run: |
-          echo "Setting up Kubernetes context using GCP GKE..."
-          
-          # Check if kubectl is already configured and can access the cluster
-          if kubectl cluster-info &>/dev/null; then
-            echo "✅ kubectl is already configured and can access the cluster"
-            echo "Current kubectl context:"
-            kubectl config current-context
-            echo "Available contexts:"
-            kubectl config get-contexts
-            echo "Cluster info:"
-            kubectl cluster-info
-            echo "✅ Kubernetes context is ready"
-          else
-            echo "kubectl not configured, setting up GKE cluster access..."
-            
-            # Verify authentication (should be done in previous step)
-            if ! gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q .; then
-              echo "❌ ERROR: GCP authentication not available"
-              echo "Please ensure GCP authentication was successful in the previous step"
-              exit 1
-            fi
-            
-            echo "✅ GCP authentication verified"
-            
-            # Set GCP project
-            gcloud config set project ${GCP_PROJECT_ID}
-            
-            # List available clusters to help debug
-            echo "Listing available GKE clusters..."
-            gcloud container clusters list --project=${GCP_PROJECT_ID} || echo "⚠️  Could not list clusters (may not have list permission)"
-            
-            # GKE cluster name is provided as required input
-            echo "Using GKE cluster: ${GKE_CLUSTER_NAME} in location ${GCP_REGION}"
-            echo "Note: Cluster name should be just the name (e.g., 'cust-demo'), not the full kubectl context path"
-            echo "Using GKE cluster: ${GKE_CLUSTER_NAME} in location ${GCP_REGION}"
-            echo "Note: Cluster name should be just the name (e.g., 'cust-demo'), not the full kubectl context path"
-            
-            # Detect if location is a zone (format: region-zone like us-central1-c) or region (format: region like us-central1)
-            # Zones end with pattern: -[single-letter] (e.g., us-central1-c, us-east1-b)
-            # Regions don't have this pattern (e.g., us-central1, us-east1)
-            # Use pattern matching instead of grep to avoid shell issues
-            case "${GCP_REGION}" in
-              *-[a-z])
-                echo "Detected zone format (${GCP_REGION}), using --zone flag"
-                gcloud container clusters get-credentials ${GKE_CLUSTER_NAME} --zone=${GCP_REGION} --project=${GCP_PROJECT_ID} --internal-ip
-                ;;
-              *)
-                echo "Using as region (${GCP_REGION}), trying --region flag"
-                gcloud container clusters get-credentials ${GKE_CLUSTER_NAME} --region=${GCP_REGION} --project=${GCP_PROJECT_ID} --internal-ip
-                ;;
-            esac
-            
-            # If internal-ip fails (cluster might be public or not support internal IP), try without it
-            if ! kubectl cluster-info --request-timeout=5s &>/dev/null; then
-              echo "⚠️  Internal IP endpoint not accessible, trying external endpoint..."
-              case "${GCP_REGION}" in
-                *-[a-z])
-                  gcloud container clusters get-credentials ${GKE_CLUSTER_NAME} --zone=${GCP_REGION} --project=${GCP_PROJECT_ID}
-                  ;;
-                *)
-                  gcloud container clusters get-credentials ${GKE_CLUSTER_NAME} --region=${GCP_REGION} --project=${GCP_PROJECT_ID}
-                  ;;
-              esac
-            else
-              echo "✅ Using internal IP endpoint (recommended for self-hosted runners)"
-            fi
-            
-            # Ensure gke-gcloud-auth-plugin is available and fix kubeconfig if needed
-            echo "Setting up gke-gcloud-auth-plugin for kubectl..."
-            
-            # Find the plugin location
-            PLUGIN_LOCATION=""
-            if [ -f ~/.config/gcloud/components/gke-gcloud-auth-plugin/bin/gke-gcloud-auth-plugin ]; then
-              PLUGIN_LOCATION="$HOME/.config/gcloud/components/gke-gcloud-auth-plugin/bin/gke-gcloud-auth-plugin"
-            elif [ -f /usr/local/bin/gke-gcloud-auth-plugin ]; then
-              PLUGIN_LOCATION="/usr/local/bin/gke-gcloud-auth-plugin"
-            elif command -v gke-gcloud-auth-plugin >/dev/null 2>&1; then
-              PLUGIN_LOCATION=$(which gke-gcloud-auth-plugin)
-            fi
-            
-            # If plugin not found, try to install it
-            if [ -z "$PLUGIN_LOCATION" ]; then
-              echo "Plugin not found, attempting to install..."
-              gcloud components install gke-gcloud-auth-plugin --quiet || true
-              if [ -f ~/.config/gcloud/components/gke-gcloud-auth-plugin/bin/gke-gcloud-auth-plugin ]; then
-                PLUGIN_LOCATION="$HOME/.config/gcloud/components/gke-gcloud-auth-plugin/bin/gke-gcloud-auth-plugin"
-                # Copy to /usr/local/bin for system-wide access
-                sudo cp "$PLUGIN_LOCATION" /usr/local/bin/ 2>/dev/null || true
-                sudo chmod +x /usr/local/bin/gke-gcloud-auth-plugin 2>/dev/null || true
-              fi
-            fi
-            
-            # Update kubeconfig to use the correct plugin path
-            if [ -n "$PLUGIN_LOCATION" ] && [ -f "$PLUGIN_LOCATION" ]; then
-              echo "✅ Found plugin at: $PLUGIN_LOCATION"
-              # Ensure it's executable
-              chmod +x "$PLUGIN_LOCATION" 2>/dev/null || true
-              
-              # Update kubeconfig to point to the plugin
-              KUBECONFIG_FILE="${KUBECONFIG:-$HOME/.kube/config}"
-              if [ -f "$KUBECONFIG_FILE" ] && [ -n "$PLUGIN_LOCATION" ]; then
-                echo "Updating kubeconfig to use plugin at: $PLUGIN_LOCATION"
-                # Use sed to update the command field specifically (more reliable than Python YAML parsing)
-                # Update: command: gke-gcloud-auth-plugin -> command: /path/to/plugin
-                sed -i "s|\(command: \|command:\s*\)gke-gcloud-auth-plugin|\1$PLUGIN_LOCATION|g" "$KUBECONFIG_FILE" 2>/dev/null || true
-                # Update: "command": "gke-gcloud-auth-plugin" -> "command": "/path/to/plugin"
-                sed -i "s|\"command\":\s*\"gke-gcloud-auth-plugin\"|\"command\": \"$PLUGIN_LOCATION\"|g" "$KUBECONFIG_FILE" 2>/dev/null || true
-                echo "✅ Kubeconfig updated"
-              fi
-              
-              # Add to PATH for this session
-              export PATH="$(dirname $PLUGIN_LOCATION):$PATH"
-              echo "$(dirname $PLUGIN_LOCATION)" >> $GITHUB_PATH
-            else
-              echo "⚠️  Warning: gke-gcloud-auth-plugin not found, kubectl authentication may fail"
-            fi
-            
-            echo "Current kubectl context:"
-            kubectl config current-context || echo "Could not get current context"
-            echo "Available contexts:"
-            kubectl config get-contexts || echo "Could not list contexts"
-            echo "Cluster info:"
-            kubectl cluster-info || echo "⚠️  Could not get cluster info (this may be expected if plugin is not working)"
-            echo "✅ Kubernetes context setup completed"
-          fi
-
       - name: Create namespace
         run: |
-          # Find and setup gke-gcloud-auth-plugin
-          echo "Setting up gke-gcloud-auth-plugin for kubectl..."
-          PLUGIN_PATH=""
-          
-          # Check common locations
-          for path in \
-            "/usr/local/bin/gke-gcloud-auth-plugin" \
-            "$HOME/.config/gcloud/components/gke-gcloud-auth-plugin/bin/gke-gcloud-auth-plugin" \
-            "/usr/bin/gke-gcloud-auth-plugin" \
-            "$(which gke-gcloud-auth-plugin 2>/dev/null)"; do
-            if [ -f "$path" ] && [ -x "$path" ]; then
-              PLUGIN_PATH="$path"
-              break
-            fi
-          done
-          
-          # If not found, try to install it
-          if [ -z "$PLUGIN_PATH" ]; then
-            echo "Plugin not found, attempting installation..."
-            # Try apt-get first (works in GitHub Actions where gcloud components is disabled)
-            sudo apt-get update -qq && sudo apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin 2>/dev/null || {
-              echo "apt-get failed, trying gcloud components..."
-              gcloud components install gke-gcloud-auth-plugin --quiet 2>/dev/null || true
-            }
-            
-            # Check again after installation
-            for path in \
-              "/usr/bin/gke-gcloud-auth-plugin" \
-              "/usr/local/bin/gke-gcloud-auth-plugin" \
-              "$HOME/.config/gcloud/components/gke-gcloud-auth-plugin/bin/gke-gcloud-auth-plugin" \
-              "$(which gke-gcloud-auth-plugin 2>/dev/null)"; do
-              if [ -f "$path" ] && [ -x "$path" ]; then
-                PLUGIN_PATH="$path"
-                # If it's in a non-standard location, copy to /usr/local/bin
-                if [ "$path" != "/usr/local/bin/gke-gcloud-auth-plugin" ] && [ "$path" != "/usr/bin/gke-gcloud-auth-plugin" ]; then
-                  sudo cp "$path" /usr/local/bin/ 2>/dev/null || true
-                  sudo chmod +x /usr/local/bin/gke-gcloud-auth-plugin 2>/dev/null || true
-                  PLUGIN_PATH="/usr/local/bin/gke-gcloud-auth-plugin"
-                fi
-                break
-              fi
-            done
-          fi
-          
-          # Verify plugin is available
-          if [ -z "$PLUGIN_PATH" ]; then
-            echo "❌ ERROR: gke-gcloud-auth-plugin could not be found or installed"
-            echo "Attempted installation methods:"
-            echo "  - apt-get install google-cloud-cli-gke-gcloud-auth-plugin"
-            echo "  - gcloud components install gke-gcloud-auth-plugin"
-            echo ""
-            echo "Please ensure the plugin is available before proceeding."
-            exit 1
-          fi
-          
-          echo "✅ Plugin found at: $PLUGIN_PATH"
-          # Ensure it's executable
-          chmod +x "$PLUGIN_PATH" 2>/dev/null || sudo chmod +x "$PLUGIN_PATH" 2>/dev/null || true
-          
-          # Add to PATH for this step
-          export PATH="$(dirname $PLUGIN_PATH):$PATH"
-          echo "$(dirname $PLUGIN_PATH)" >> $GITHUB_PATH
-          
-          # Update kubeconfig to use absolute path
-          KUBECONFIG_FILE="${KUBECONFIG:-$HOME/.kube/config}"
-          if [ -f "$KUBECONFIG_FILE" ]; then
-            echo "Updating kubeconfig to use plugin at: $PLUGIN_PATH"
-            # Show current kubeconfig exec section for debugging
-            echo "Current kubeconfig exec section:"
-            grep -A 5 "exec:" "$KUBECONFIG_FILE" | head -10 || echo "No exec section found"
-            
-            # Update kubeconfig using sed (reliable and YAML-safe)
-            # Update: command: gke-gcloud-auth-plugin -> command: /path/to/plugin
-            sed -i.bak "s|\(command: \|command:\s*\)gke-gcloud-auth-plugin|\1$PLUGIN_PATH|g" "$KUBECONFIG_FILE" 2>/dev/null || true
-            # Update: "command": "gke-gcloud-auth-plugin" -> "command": "/path/to/plugin"
-            sed -i.bak "s|\"command\":\s*\"gke-gcloud-auth-plugin\"|\"command\": \"$PLUGIN_PATH\"|g" "$KUBECONFIG_FILE" 2>/dev/null || true
-            # Also handle cases where it's just the command name without quotes
-            sed -i.bak "s|gke-gcloud-auth-plugin|$PLUGIN_PATH|g" "$KUBECONFIG_FILE" 2>/dev/null || true
-            echo "✅ Kubeconfig updated using sed"
-            
-            # Verify the update
-            echo "Updated kubeconfig exec section:"
-            grep -A 5 "exec:" "$KUBECONFIG_FILE" | head -10 || echo "No exec section found"
-            
-            echo "✅ Plugin configured at: $PLUGIN_PATH"
-          else
-            echo "⚠️  Warning: Kubeconfig file not found at: $KUBECONFIG_FILE"
-          fi
-          
-          # Final verification that plugin is accessible
-          if ! command -v gke-gcloud-auth-plugin >/dev/null 2>&1 && [ ! -f "$PLUGIN_PATH" ]; then
-            echo "❌ ERROR: Plugin is not accessible"
-            exit 1
-          fi
-          
-          # Test cluster connectivity before attempting operations
-          echo "Testing cluster connectivity..."
-          CLUSTER_ENDPOINT=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")
-          if [ -n "$CLUSTER_ENDPOINT" ]; then
-            echo "Cluster endpoint: $CLUSTER_ENDPOINT"
-            
-            # If running in-cluster (self-hosted runner on GKE), use internal service endpoint
-            if [ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
-              echo "✅ Detected in-cluster execution (self-hosted runner)"
-              echo "Updating kubeconfig to use internal Kubernetes service endpoint..."
-              INTERNAL_ENDPOINT="https://kubernetes.default.svc"
-              
-              # Get the current cluster name from kubeconfig
-              CLUSTER_NAME=$(kubectl config view --minify -o jsonpath='{.clusters[0].name}' 2>/dev/null || echo "")
-              
-              if [ -n "$CLUSTER_NAME" ] && [ -f "$KUBECONFIG_FILE" ]; then
-                # Get the current server URL to avoid double replacement
-                CURRENT_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")
-                echo "Current server URL: $CURRENT_SERVER"
-                
-                # Only update if it's not already the internal endpoint
-                if [ "$CURRENT_SERVER" != "$INTERNAL_ENDPOINT" ]; then
-                  # Use kubectl config set-cluster to update the server URL (more reliable than sed)
-                  if kubectl config set-cluster "$CLUSTER_NAME" --server="$INTERNAL_ENDPOINT" 2>/dev/null; then
-                    echo "✅ Updated kubeconfig using kubectl config set-cluster"
-                  else
-                    echo "⚠️  kubectl config set-cluster failed, trying sed as fallback..."
-                    # Fallback to sed - be very specific to avoid double replacement
-                    # Only match and replace the server line in the cluster section
-                    sed -i.bak "/clusters:/,/^[^ ]/ { s|^\(\s*server:\s*\).*|\1$INTERNAL_ENDPOINT|; }" "$KUBECONFIG_FILE" 2>/dev/null || true
-                  fi
-                  
-                  # Verify the update
-                  NEW_ENDPOINT=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")
-                  echo "New endpoint: $NEW_ENDPOINT"
-                  
-                  # Check for any malformed URLs
-                  if echo "$NEW_ENDPOINT" | grep -q "kubernetes.default.svc.*kubernetes.default.svc"; then
-                    echo "⚠️  WARNING: Detected duplicated hostname, fixing..."
-                    sed -i.bak "s|kubernetes.default.svckubernetes.default.svc|kubernetes.default.svc|g" "$KUBECONFIG_FILE" 2>/dev/null || true
-                    NEW_ENDPOINT=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")
-                    echo "Fixed endpoint: $NEW_ENDPOINT"
-                  fi
-                  
-                  # Final verification
-                  if [ "$NEW_ENDPOINT" != "$INTERNAL_ENDPOINT" ]; then
-                    echo "⚠️  WARNING: Endpoint update may have failed, endpoint is: $NEW_ENDPOINT"
-                  else
-                    echo "✅ Endpoint correctly set to: $INTERNAL_ENDPOINT"
-                  fi
-                else
-                  echo "✅ Server URL is already set to internal endpoint"
-                fi
-              else
-                echo "⚠️  Could not determine cluster name or kubeconfig not found"
-              fi
-            fi
-            
-            # Extract hostname from endpoint
-            CLUSTER_HOST=$(echo "$CLUSTER_ENDPOINT" | sed 's|https\?://||' | cut -d: -f1)
-            echo "Testing connectivity to $CLUSTER_HOST:443..."
-            
-            # Test basic connectivity (timeout after 5 seconds)
-            if timeout 5 bash -c "echo > /dev/tcp/$CLUSTER_HOST/443" 2>/dev/null; then
-              echo "✅ Network connectivity to cluster endpoint is OK"
-            else
-              echo "⚠️  WARNING: Cannot reach cluster endpoint $CLUSTER_HOST:443"
-              echo "This might indicate:"
-              echo "  1. The cluster is private (not publicly accessible)"
-              echo "  2. Firewall rules are blocking access"
-              echo "  3. Network policies are restricting access"
-              echo ""
-              echo "For self-hosted runners on GKE, try:"
-              echo "  - Using internal IP endpoint (--internal-ip flag)"
-              echo "  - Using internal Kubernetes service (kubernetes.default.svc)"
-              echo ""
-              echo "Attempting kubectl operations anyway (may fail)..."
-            fi
-          fi
-          
-          # Verify kubeconfig is valid before testing
-          echo "Verifying kubeconfig structure..."
-          CURRENT_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")
-          echo "Current server from kubeconfig: $CURRENT_SERVER"
-          
-          # Check for malformed URLs (duplicated hostnames)
-          if echo "$CURRENT_SERVER" | grep -q "kubernetes.default.svckubernetes.default.svc"; then
-            echo "⚠️  WARNING: Detected malformed URL with duplicated hostname, fixing..."
-            # Fix the duplicated hostname
-            sed -i.bak "s|kubernetes.default.svckubernetes.default.svc|kubernetes.default.svc|g" "$KUBECONFIG_FILE" 2>/dev/null || true
-            # Re-read the server URL
-            CURRENT_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null || echo "")
-            echo "Fixed server URL: $CURRENT_SERVER"
-          fi
-          
-          # Try to get cluster info first (this will fail fast if there's a connectivity issue)
-          echo "Checking cluster access..."
-          if kubectl cluster-info --request-timeout=10s 2>&1 | head -5; then
-            echo "✅ Cluster is accessible"
-          else
-            echo "⚠️  WARNING: Could not get cluster info via kubeconfig"
-            
-            # If in-cluster and kubeconfig failed, try using in-cluster config directly
-            if [ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
-              echo "Attempting to use in-cluster config directly..."
-              # Create a temporary kubeconfig using in-cluster config
-              IN_CLUSTER_CONFIG="/tmp/in-cluster-kubeconfig"
-              # Create in-cluster kubeconfig
-              CA_DATA=$(cat /var/run/secrets/kubernetes.io/serviceaccount/ca.crt | base64 | tr -d '\n')
-              TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-              NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo default)
-              
-              # Write kubeconfig using printf to avoid heredoc YAML parsing issues
-              printf 'apiVersion: v1\n' > "$IN_CLUSTER_CONFIG"
-              printf 'kind: Config\n' >> "$IN_CLUSTER_CONFIG"
-              printf 'clusters:\n' >> "$IN_CLUSTER_CONFIG"
-              printf '- cluster:\n' >> "$IN_CLUSTER_CONFIG"
-              printf '    certificate-authority-data: %s\n' "$CA_DATA" >> "$IN_CLUSTER_CONFIG"
-              printf '    server: https://kubernetes.default.svc\n' >> "$IN_CLUSTER_CONFIG"
-              printf '  name: in-cluster\n' >> "$IN_CLUSTER_CONFIG"
-              printf 'contexts:\n' >> "$IN_CLUSTER_CONFIG"
-              printf '- context:\n' >> "$IN_CLUSTER_CONFIG"
-              printf '    cluster: in-cluster\n' >> "$IN_CLUSTER_CONFIG"
-              printf '    namespace: %s\n' "$NAMESPACE" >> "$IN_CLUSTER_CONFIG"
-              printf '    user: in-cluster-user\n' >> "$IN_CLUSTER_CONFIG"
-              printf '  name: in-cluster-context\n' >> "$IN_CLUSTER_CONFIG"
-              printf 'current-context: in-cluster-context\n' >> "$IN_CLUSTER_CONFIG"
-              printf 'users:\n' >> "$IN_CLUSTER_CONFIG"
-              printf '- name: in-cluster-user\n' >> "$IN_CLUSTER_CONFIG"
-              printf '  user:\n' >> "$IN_CLUSTER_CONFIG"
-              printf '    token: %s\n' "$TOKEN" >> "$IN_CLUSTER_CONFIG"
-              
-              # Try using the in-cluster config
-              if KUBECONFIG="$IN_CLUSTER_CONFIG" kubectl cluster-info --request-timeout=10s 2>&1 | head -5; then
-                echo "✅ Cluster is accessible via in-cluster config"
-                # Use the in-cluster config for subsequent operations
-                export KUBECONFIG="$IN_CLUSTER_CONFIG"
-                echo "KUBECONFIG=$IN_CLUSTER_CONFIG" >> $GITHUB_ENV
-                echo "Using in-cluster config for kubectl operations"
-              else
-                echo "❌ ERROR: Cannot access cluster even with in-cluster config"
-                echo "This indicates:"
-                echo "  1. The runner pod's service account may not have proper permissions"
-                echo "  2. Network policies may be blocking pod-to-API-server communication"
-                echo "  3. The API server may not be accessible from the pod network"
-              fi
-            else
-              echo "This is likely a network connectivity problem."
-              echo "The cluster might be private or behind a firewall."
-            fi
-          fi
-          
-          echo "Creating namespace '${DEPLOYMENT_ENV_NAME}' if it doesn't exist..."
-          # Use a timeout to fail fast if there's a connectivity issue
-          if kubectl create namespace ${DEPLOYMENT_ENV_NAME} --dry-run=client -o yaml 2>/dev/null | kubectl apply -f - --validate=false --request-timeout=10s 2>&1; then
-          echo "Namespace '${DEPLOYMENT_ENV_NAME}' is ready."
-          else
-            echo "❌ ERROR: Failed to create/verify namespace"
-            echo ""
-            echo "Troubleshooting steps:"
-            echo "1. Check if the cluster is private:"
-            echo "   gcloud container clusters describe ${GKE_CLUSTER_NAME} --zone=${GCP_REGION} --project=${GCP_PROJECT_ID} | grep -i private"
-            echo ""
-            echo "2. Check cluster endpoint accessibility:"
-            echo "   kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'"
-            echo ""
-            echo "3. For private clusters, consider using:"
-            echo "   - Cloud Build (has network access to private clusters)"
-            echo "   - VPN/Cloud VPN connection"
-            echo "   - Bastion host or proxy"
-            exit 1
-          fi
+          echo "📦 Creating namespace '${DEPLOYMENT_ENV_NAME}'..."
+          kubectl create namespace "${DEPLOYMENT_ENV_NAME}" --dry-run=client -o yaml | kubectl apply -f -
+          echo "✅ Namespace '${DEPLOYMENT_ENV_NAME}' is ready"
 
       - name: Download installation scripts
         run: |
-          echo "Downloading installation scripts..."
-          curl -s https://raw.githubusercontent.com/privacera/privacera-installation-scripts/refs/heads/main/base-install/install_pm.sh -o install_pm.sh
-          curl -s https://raw.githubusercontent.com/privacera/privacera-installation-scripts/refs/heads/main/base-install/bootstrap_privacera.sh -o bootstrap_privacera.sh
+          echo "📥 Downloading installation scripts..."
+          BASE_URL="https://raw.githubusercontent.com/privacera/privacera-installation-scripts/refs/heads/main/base-install"
           
-          # Download GCP-specific scripts
-          echo "Downloading GCP-specific scripts..."
-          curl -s https://raw.githubusercontent.com/privacera/privacera-installation-scripts/refs/heads/main/base-install/self-managed/gcp/gcp_pm_config_env.sh -o gcp_pm_config_env.sh || echo "GCP script not found, will create config manually"
+          curl -fsSL "${BASE_URL}/install_pm.sh" -o install_pm.sh
+          curl -fsSL "${BASE_URL}/bootstrap_privacera.sh" -o bootstrap_privacera.sh
+          curl -fsSL "${BASE_URL}/self-managed/gcp/gcp_pm_config_env.sh" -o gcp_pm_config_env.sh 2>/dev/null || echo "GCP script not found, will create config manually"
           
-          # Fix non-portable cp -n commands in scripts (replace with cp --update=none or just cp)
-          echo "Fixing non-portable cp -n commands in scripts..."
+          # Fix non-portable cp -n commands
           for script in install_pm.sh bootstrap_privacera.sh; do
             if [ -f "$script" ]; then
-              # Replace cp -n with cp (allow overwriting) or cp --update=none (prevent overwriting)
-              # Using cp without -n to allow overwriting (safer for automation)
-              sed -i.bak 's/cp -n/cp/g' "$script" 2>/dev/null || true
-              # Also handle cp -nv and cp -nrv
-              sed -i.bak 's/cp -nv/cp -v/g' "$script" 2>/dev/null || true
-              sed -i.bak 's/cp -nrv/cp -rv/g' "$script" 2>/dev/null || true
-              echo "✅ Fixed cp commands in $script"
+              sed -i 's/cp -n/cp/g; s/cp -nv/cp -v/g; s/cp -nrv/cp -rv/g' "$script"
             fi
           done
           
-          chmod a+x *.sh
+          chmod +x *.sh
+          echo "✅ Installation scripts downloaded"
 
       - name: Configure environment variables
         env:
           PRIVACERA_HUB_USER: ${{ secrets.PRIVACERA_HUB_USER }}
           PRIVACERA_HUB_PASSWORD: ${{ secrets.PRIVACERA_HUB_PASSWORD }}
         run: |
-          echo "Configuring environment variables..."
+          echo "⚙️ Configuring environment variables..."
           
-          # Move to workspace directory to ensure files are created in the right place
-          cd "${GITHUB_WORKSPACE}"
+          cat > gcp_pm_config_env.sh << 'ENVEOF'
+          # GCP Environment Configuration
+          DEPLOYMENT_ENV_TYPE="GCP"
+          ENVEOF
           
-          # Configure GCP environment variables
-          CONFIG_FILE="gcp_pm_config_env.sh"
-          echo "# GCP Environment Configuration" > ${CONFIG_FILE}
-          echo "DEPLOYMENT_ENV_TYPE=\"GCP\"" >> ${CONFIG_FILE}
-          echo "DEPLOYMENT_ENV_NAME=\"${DEPLOYMENT_ENV_NAME}\"" >> ${CONFIG_FILE}
-          echo "PRIV_MGR_IMAGE=\"${PRIV_MGR_IMAGE}\"" >> ${CONFIG_FILE}
-          echo "PRIV_MGR_PACKAGE=\"${PRIV_MGR_PACKAGE}\"" >> ${CONFIG_FILE}
-          echo "PRIVACERA_HUB_USER=\"${PRIVACERA_HUB_USER}\"" >> ${CONFIG_FILE}
-          echo "PRIVACERA_HUB_PASSWORD=\"${PRIVACERA_HUB_PASSWORD}\"" >> ${CONFIG_FILE}
-          echo "GCP_PROJECT_ID=\"${GCP_PROJECT_ID}\"" >> ${CONFIG_FILE}
-          echo "GCP_REGION=\"${GCP_REGION}\"" >> ${CONFIG_FILE}
-          echo "" >> ${CONFIG_FILE}
-          echo "# Export all variables" >> ${CONFIG_FILE}
-          echo "export DEPLOYMENT_ENV_TYPE DEPLOYMENT_ENV_NAME PRIV_MGR_IMAGE PRIV_MGR_PACKAGE" >> ${CONFIG_FILE}
-          echo "export PRIVACERA_HUB_USER PRIVACERA_HUB_PASSWORD" >> ${CONFIG_FILE}
-          echo "export GCP_PROJECT_ID GCP_REGION" >> ${CONFIG_FILE}
-
-          echo "Using configuration file: ${CONFIG_FILE}"
+          cat >> gcp_pm_config_env.sh << EOF
+          DEPLOYMENT_ENV_NAME="${DEPLOYMENT_ENV_NAME}"
+          PRIV_MGR_IMAGE="${PRIV_MGR_IMAGE}"
+          PRIV_MGR_PACKAGE="${PRIV_MGR_PACKAGE}"
+          PRIVACERA_HUB_USER="${PRIVACERA_HUB_USER}"
+          PRIVACERA_HUB_PASSWORD="${PRIVACERA_HUB_PASSWORD}"
+          GCP_PROJECT_ID="${GCP_PROJECT_ID}"
+          GCP_REGION="${GCP_REGION}"
+          
+          export DEPLOYMENT_ENV_TYPE DEPLOYMENT_ENV_NAME PRIV_MGR_IMAGE PRIV_MGR_PACKAGE
+          export PRIVACERA_HUB_USER PRIVACERA_HUB_PASSWORD
+          export GCP_PROJECT_ID GCP_REGION
+          EOF
+          
+          echo "✅ Environment configuration created"
 
       - name: Run installation script
         run: |
-          echo "Setting up Privacera Manager..."
-          # Create workspace directory and set HOME
+          echo "🚀 Setting up Privacera Manager..."
           export HOME="${GITHUB_WORKSPACE}"
           cd "${HOME}"
           
-          # Create a cp wrapper script to handle non-portable cp -n flag
-          # This will intercept cp calls and fix the -n flag issue
-          mkdir -p "${HOME}/bin"
-          printf '#!/bin/bash\n' > "${HOME}/bin/cp"
-          printf '# Wrapper for cp command to handle non-portable -n flag\n' >> "${HOME}/bin/cp"
-          printf 'args=()\n' >> "${HOME}/bin/cp"
-          printf 'for arg in "$@"; do\n' >> "${HOME}/bin/cp"
-          printf '  case "$arg" in\n' >> "${HOME}/bin/cp"
-          printf '    -n)\n' >> "${HOME}/bin/cp"
-          printf '      # Remove -n flag (allow overwriting for automation)\n' >> "${HOME}/bin/cp"
-          printf '      continue\n' >> "${HOME}/bin/cp"
-          printf '      ;;\n' >> "${HOME}/bin/cp"
-          printf '    -nv)\n' >> "${HOME}/bin/cp"
-          printf '      args+=(-v)\n' >> "${HOME}/bin/cp"
-          printf '      ;;\n' >> "${HOME}/bin/cp"
-          printf '    -nrv)\n' >> "${HOME}/bin/cp"
-          printf '      args+=(-rv)\n' >> "${HOME}/bin/cp"
-          printf '      ;;\n' >> "${HOME}/bin/cp"
-          printf '    *)\n' >> "${HOME}/bin/cp"
-          printf '      args+=("$arg")\n' >> "${HOME}/bin/cp"
-          printf '      ;;\n' >> "${HOME}/bin/cp"
-          printf '  esac\n' >> "${HOME}/bin/cp"
-          printf 'done\n' >> "${HOME}/bin/cp"
-          printf '# Call the real cp command\n' >> "${HOME}/bin/cp"
-          printf '/bin/cp "${args[@]}"\n' >> "${HOME}/bin/cp"
-          chmod +x "${HOME}/bin/cp"
-          # Add to PATH (must be before /usr/bin so our wrapper is found first)
-          export PATH="${HOME}/bin:$PATH"
-          echo "✅ Created cp wrapper to handle non-portable -n flag"
-
-          # Use GCP config file
           CONFIG_FILE="gcp_pm_config_env.sh"
-
-          echo "Using config file: ${CONFIG_FILE}"
           
-          # Verify config file exists
-          if [ ! -f "${CONFIG_FILE}" ]; then
-            echo "ERROR: Config file ${CONFIG_FILE} not found!"
-            ls -la *.sh
-            exit 1
-          fi
-
-          # Run installation script
-          echo "Running installation script..."
-          # Set to continue on errors from cp -n warnings (non-fatal)
-          set +e
-          bash install_pm.sh ${CONFIG_FILE}
-          INSTALL_EXIT_CODE=$?
-          set -e
-          
-          # Check if installation failed (exit code > 1 indicates real error, 1 might be just warnings)
-          if [ $INSTALL_EXIT_CODE -gt 1 ]; then
-            echo "❌ ERROR: Installation script failed with exit code $INSTALL_EXIT_CODE"
-            exit 1
-          elif [ $INSTALL_EXIT_CODE -eq 1 ]; then
-            echo "⚠️  Installation script exited with code 1 (may be due to cp -n warnings)"
-            echo "Checking if installation actually succeeded..."
+          # Run installation
+          bash install_pm.sh "${CONFIG_FILE}" || {
             if [ -d "${HOME}/privacera/privacera-manager" ]; then
-              echo "✅ Installation directory exists, continuing..."
+              echo "⚠️ Script exited with warnings but installation directory exists"
             else
-              echo "❌ ERROR: Installation directory not found, installation failed"
+              echo "❌ Installation failed"
               exit 1
             fi
-          else
-            echo "✅ Installation script completed successfully"
-          fi
-
-          # Run bootstrap script
-          echo "Running bootstrap script..."
-          set +e
-          bash bootstrap_privacera.sh ${CONFIG_FILE}
-          BOOTSTRAP_EXIT_CODE=$?
-          set -e
+          }
           
-          # Check if bootstrap failed
-          if [ $BOOTSTRAP_EXIT_CODE -gt 1 ]; then
-            echo "❌ ERROR: Bootstrap script failed with exit code $BOOTSTRAP_EXIT_CODE"
-            exit 1
-          elif [ $BOOTSTRAP_EXIT_CODE -eq 1 ]; then
-            echo "⚠️  Bootstrap script exited with code 1 (may be due to cp -n warnings)"
-            echo "Checking if bootstrap actually succeeded..."
+          # Run bootstrap
+          bash bootstrap_privacera.sh "${CONFIG_FILE}" || {
             if [ -d "${HOME}/privacera/privacera-manager/config" ]; then
-              echo "✅ Config directory exists, continuing..."
+              echo "⚠️ Script exited with warnings but config directory exists"
             else
-              echo "❌ ERROR: Config directory not found, bootstrap failed"
+              echo "❌ Bootstrap failed"
               exit 1
             fi
+          }
+          
+          # Use custom-vars from repo if available
+          if [ -d "${GITHUB_WORKSPACE}/custom-vars" ] && [ -n "$(ls -A ${GITHUB_WORKSPACE}/custom-vars 2>/dev/null)" ]; then
+            echo "📁 Using custom-vars from repository..."
+            rm -rf "${HOME}/privacera/privacera-manager/config/custom-vars/"*
+            cp -rv "${GITHUB_WORKSPACE}/custom-vars/"* "${HOME}/privacera/privacera-manager/config/custom-vars/"
           else
-            echo "✅ Bootstrap script completed successfully"
+            echo "📁 Using generated custom-vars..."
+            rm -f "${HOME}/privacera/privacera-manager/config/custom-vars/vars.privacera-secrets.yml"
+            rm -f "${HOME}/privacera/privacera-manager/config/custom-vars/vars.encrypt.secrets.yml"
           fi
-
-          # List the generated files
-          echo "Checking generated files:"
-          ls -la ${HOME}/privacera/privacera-manager/config/custom-vars/
-          ls -la ${HOME}/privacera/privacera-manager/config/
-
-          # Check and use custom-vars from repo if they exist
-          if [ -d "${GITHUB_WORKSPACE}/custom-vars" ] && [ -n "$(ls -A ${GITHUB_WORKSPACE}/custom-vars)" ]; then
-            echo "Found custom-vars in repo, using them instead of generated ones..."
-            rm -rf ${HOME}/privacera/privacera-manager/config/custom-vars/*
-            cp -rv ${GITHUB_WORKSPACE}/custom-vars/* ${HOME}/privacera/privacera-manager/config/custom-vars/
-            echo "Custom vars after replacement:"
-            ls -la ${HOME}/privacera/privacera-manager/config/custom-vars/
-          else
-            echo "No custom-vars found in repo, using generated ones..."
-            
-            # Remove unwanted files from generated custom-vars
-            echo "Removing unwanted files..."
-            rm -f ${HOME}/privacera/privacera-manager/config/custom-vars/vars.privacera-secrets.yml
-            rm -f ${HOME}/privacera/privacera-manager/config/custom-vars/vars.encrypt.secrets.yml
-            
-            echo "Removed vars.privacera-secrets.yml and vars.encrypt.secrets.yml"
-            
-            ls -la ${HOME}/privacera/privacera-manager/config/custom-vars/
-          fi
-
-
-          # Copy the generated files to a location we can artifact
-          mkdir -p ${GITHUB_WORKSPACE}/privacera-manager
-          cp -rv ${HOME}/privacera/privacera-manager/* ${GITHUB_WORKSPACE}/privacera-manager/
+          
+          # Copy to workspace for artifacts
+          mkdir -p "${GITHUB_WORKSPACE}/privacera-manager"
+          cp -rv "${HOME}/privacera/privacera-manager/"* "${GITHUB_WORKSPACE}/privacera-manager/"
+          
+          echo "✅ Privacera Manager setup complete"
 
       - name: Generate Helm charts
         run: |
-          echo "Generating Helm charts..."
-          cd ${GITHUB_WORKSPACE}/privacera-manager
-          echo "Current directory structure before setup:"
-          pwd
-          ls -la
-          echo "Running setup script..."
+          echo "⎈ Generating Helm charts..."
+          cd "${GITHUB_WORKSPACE}/privacera-manager"
           ./privacera-manager.sh setup
-          echo "Current directory structure after setup:"
-          ls -la
-          echo "Helm charts directory content:"
-          ls -la output/kubernetes/helm/ || echo "Helm charts directory not found at output/kubernetes/helm/"
-
-          # Create output directory and copy generated charts
-          cd "${GITHUB_WORKSPACE}"
-          mkdir -p helm-charts-output
-          echo "Copying helm charts..."
-          cp -rv ${GITHUB_WORKSPACE}/privacera-manager/output/kubernetes/helm/* helm-charts-output/ || echo "Failed to copy helm charts"
-
-          echo "Final output directory contents:"
-          ls -la helm-charts-output/
+          
+          mkdir -p "${GITHUB_WORKSPACE}/helm-charts-output"
+          cp -rv output/kubernetes/helm/* "${GITHUB_WORKSPACE}/helm-charts-output/" 2>/dev/null || echo "⚠️ No helm charts to copy"
+          
+          echo "✅ Helm charts generated"
 
       - name: Fix deprecated Kubernetes API versions
         run: |
-          echo "🔧 Fixing deprecated Kubernetes API versions in Helm charts..."
-          if [ -d "privacera-manager/output/kubernetes/helm" ]; then
-            find privacera-manager/output/kubernetes/helm/ -name "*.yaml" -o -name "*.yml" | while read -r file; do
-              if [ -f "$file" ]; then
-                # Fix RoleBinding API version (rbac.authorization.k8s.io/v1beta1 → v1)
-                if grep -q "rbac.authorization.k8s.io/v1beta1" "$file"; then
-                  echo "Updating RoleBinding API version in: $file"
-                  sed -i 's|rbac.authorization.k8s.io/v1beta1|rbac.authorization.k8s.io/v1|g' "$file"
-                fi
-                
-                # Fix PodDisruptionBudget API version (policy/v1beta1 → policy/v1)
-                if grep -q "policy/v1beta1" "$file"; then
-                  echo "Updating PodDisruptionBudget API version in: $file"
-                  sed -i 's|policy/v1beta1|policy/v1|g' "$file"
-                fi
-                
-                # Fix Deployment API version (extensions/v1beta1 → apps/v1)
-                if grep -q "extensions/v1beta1" "$file" && (grep -q "kind: Deployment\|kind: ReplicaSet\|kind: DaemonSet" "$file"); then
-                  echo "Updating Deployment API version in: $file"
-                  sed -i 's|extensions/v1beta1|apps/v1|g' "$file"
-                fi
-                
-                # Fix Ingress API version (networking.k8s.io/v1beta1 → networking.k8s.io/v1)
-                if grep -q "networking.k8s.io/v1beta1" "$file" && grep -q "kind: Ingress" "$file"; then
-                  echo "Updating Ingress API version in: $file"
-                  sed -i 's|networking.k8s.io/v1beta1|networking.k8s.io/v1|g' "$file"
-                fi
-              fi
-            done
-            echo "✅ API version updates completed"
-            
-            # Show which files were updated
-            echo "📋 Verification of updated API versions:"
-            find privacera-manager/output/kubernetes/helm/ -name "*.yaml" -o -name "*.yml" | xargs grep -l "rbac.authorization.k8s.io/v1\|policy/v1\|apps/v1\|networking.k8s.io/v1" | head -10 || echo "No API version matches found"
-          else
-            echo "⚠️ Helm charts directory not found, skipping API version fixes"
-          fi
+          echo "🔧 Fixing deprecated Kubernetes API versions..."
+          
+          find privacera-manager/output/kubernetes/helm/ -type f \( -name "*.yaml" -o -name "*.yml" \) 2>/dev/null | while read -r file; do
+            sed -i \
+              -e 's|rbac.authorization.k8s.io/v1beta1|rbac.authorization.k8s.io/v1|g' \
+              -e 's|policy/v1beta1|policy/v1|g' \
+              -e 's|extensions/v1beta1|apps/v1|g' \
+              -e 's|networking.k8s.io/v1beta1|networking.k8s.io/v1|g' \
+              "$file" 2>/dev/null || true
+          done
+          
+          echo "✅ API versions updated"
 
       - name: Deploy to Kubernetes
         run: |
-          echo "Running upgrade..."
-          cd ${GITHUB_WORKSPACE}/privacera-manager
-          ls -la  # Debug: List directory contents
-           
-          chmod +x ./pm_with_helm.sh  # Ensure script is executable
+          echo "🚀 Deploying to Kubernetes..."
+          cd "${GITHUB_WORKSPACE}/privacera-manager"
+          source "${GITHUB_WORKSPACE}/gcp_pm_config_env.sh"
+          
+          chmod +x ./pm_with_helm.sh
           ./pm_with_helm.sh upgrade
-          
-          # Source environment variables
-          source ${GITHUB_WORKSPACE}/gcp_pm_config_env.sh
-          
-          echo "Running setup and installation..."
-          cd ${GITHUB_WORKSPACE}/privacera-manager
           ./privacera-manager.sh setup && ./pm_with_helm.sh install
           
-          # GCP-specific post-deployment steps
-          echo "GCP deployment post-installation steps..."
-          
-          # Get portal IP addresses from LoadBalancer services (ignoring ingress)
-          echo "Waiting for LoadBalancer services to get external IP addresses..."
+          # Wait for LoadBalancer IPs
+          echo "⏳ Waiting for LoadBalancer services..."
           PORTAL_IPS_FILE="${GITHUB_WORKSPACE}/portal-ips.txt"
-          rm -f "$PORTAL_IPS_FILE"
           
-          # Wait for services to get external IPs
-          for i in {1..60}; do
-            echo "Attempt $i: Checking LoadBalancer services for external IPs..."
-            
-            # Get all LoadBalancer services and their external IPs using kubectl jsonpath
-            SERVICES_WITH_IPS=$(kubectl -n ${DEPLOYMENT_ENV_NAME} get svc -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.name}{"\t"}{.status.loadBalancer.ingress[0].ip}{"\t"}{.status.loadBalancer.ingress[0].hostname}{"\n"}{end}' 2>/dev/null || echo "")
-            
-            if [ -n "$SERVICES_WITH_IPS" ]; then
-              HAS_IP=false
-              while IFS=$'\t' read -r service_name ip hostname; do
-                # Use IP if available, otherwise use hostname, skip if both are empty
-                if [ -n "$ip" ] && [ "$ip" != "<none>" ]; then
-                  echo "  - Service: $service_name, External IP: $ip"
-                  echo "$service_name: $ip" >> "$PORTAL_IPS_FILE"
-                  HAS_IP=true
-                elif [ -n "$hostname" ] && [ "$hostname" != "<none>" ]; then
-                  echo "  - Service: $service_name, External Hostname: $hostname"
-                  echo "$service_name: $hostname" >> "$PORTAL_IPS_FILE"
-                  HAS_IP=true
-                fi
-              done <<< "$SERVICES_WITH_IPS"
-              
-              if [ "$HAS_IP" = "true" ]; then
-                echo "✅ LoadBalancer services have external IPs/hostnames"
-                  break
-                fi
-              fi
-              
-            if [ $i -eq 60 ]; then
-              echo "⚠️ Warning: Could not get external IPs for LoadBalancer services after 60 attempts"
-              echo "Current service status:"
-              kubectl -n ${DEPLOYMENT_ENV_NAME} get svc -o wide || true
-            else
-              echo "Services not ready yet, waiting 10 seconds..."
-                sleep 10
-              fi
+          for i in {1..30}; do
+            kubectl -n "${DEPLOYMENT_ENV_NAME}" get svc -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.name}{"\t"}{.status.loadBalancer.ingress[0].ip}{"\n"}{end}' 2>/dev/null | while IFS=$'\t' read -r svc ip; do
+              [ -n "$ip" ] && echo "$svc: $ip" >> "$PORTAL_IPS_FILE"
             done
+            
+            [ -s "$PORTAL_IPS_FILE" ] && break
+            sleep 10
+          done
           
-          # Display portal IP addresses
-          if [ -f "$PORTAL_IPS_FILE" ] && [ -s "$PORTAL_IPS_FILE" ]; then
-            echo ""
-            echo "=== Portal IP Addresses ==="
-            cat "$PORTAL_IPS_FILE"
-            echo "============================"
-            echo "✅ Portal IPs saved to portal-ips.txt"
-          else
-            echo "⚠️ Warning: No portal IP addresses found"
-            echo "Listing all services:"
-            kubectl -n ${DEPLOYMENT_ENV_NAME} get svc -o wide || true
-          fi
+          # Display service URLs
+          cat output/service-urls.txt 2>/dev/null || echo "⚠️ service-urls.txt not found"
           
-          echo "Displaying service URLs..."
-          cat output/service-urls.txt || echo "⚠️ Warning: service-urls.txt not found"
-          
-          echo "Running post-installation steps..."
           ./privacera-manager.sh post-install
           
-          echo "✅ GCP deployment completed successfully"
+          echo "✅ Deployment completed"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -1086,38 +509,39 @@ jobs:
 
       - name: Display deployment status
         run: |
-          echo "=== Deployment Summary ==="
+          echo ""
+          echo "========================================"
+          echo "       DEPLOYMENT SUMMARY"
+          echo "========================================"
           echo "Environment: ${DEPLOYMENT_ENV_NAME}"
-          echo "Platform: GCP"
+          echo "Platform: GCP (GKE)"
+          echo "Project: ${GCP_PROJECT_ID}"
+          echo "Region/Zone: ${GCP_REGION}"
+          echo "Cluster: ${GKE_CLUSTER_NAME}"
           echo "Privacera Version: ${PRIVACERA_VERSION}"
-          echo "Namespace: ${DEPLOYMENT_ENV_NAME}"
-          echo "=========================="
+          echo "========================================"
+          echo ""
           
-          # Display portal IP addresses
           if [ -f "${GITHUB_WORKSPACE}/portal-ips.txt" ]; then
+            echo "📍 Portal IP Addresses:"
+            cat "${GITHUB_WORKSPACE}/portal-ips.txt"
             echo ""
-            echo "=== Portal IP Addresses ==="
-            cat ${GITHUB_WORKSPACE}/portal-ips.txt
-            echo "============================"
-          else
-            echo ""
-            echo "Getting current portal IP addresses from services..."
-            kubectl -n ${DEPLOYMENT_ENV_NAME} get svc -o wide | grep LoadBalancer || echo "No LoadBalancer services found"
           fi
           
-          # Display service URLs if available
-          if [ -f "${GITHUB_WORKSPACE}/privacera-manager/output/service-urls.txt" ]; then
-            echo ""
-            echo "Service URLs:"
-            cat ${GITHUB_WORKSPACE}/privacera-manager/output/service-urls.txt
-          fi
-          
-          # Display pod status
+          echo "📦 Pods:"
+          kubectl get pods -n "${DEPLOYMENT_ENV_NAME}" 2>/dev/null || echo "Unable to get pods"
           echo ""
-          echo "Pod status in namespace ${DEPLOYMENT_ENV_NAME}:"
-          kubectl get pods -n ${DEPLOYMENT_ENV_NAME} || echo "Unable to get pod status" 
           
-          # Display service status
+          echo "🌐 Services:"
+          kubectl get svc -n "${DEPLOYMENT_ENV_NAME}" 2>/dev/null || echo "Unable to get services"
           echo ""
-          echo "Service status in namespace ${DEPLOYMENT_ENV_NAME}:"
-          kubectl get svc -n ${DEPLOYMENT_ENV_NAME} || echo "Unable to get service status" 
+          
+          echo "✅ Deployment complete!"
+
+      - name: Cleanup sensitive files
+        if: always()
+        run: |
+          # Remove the temporary key file
+          rm -f "${GCP_KEY_FILE}" 2>/dev/null || true
+          rm -f "${RUNNER_TEMP}/gcp-service-account-key.json" 2>/dev/null || true
+          echo "🧹 Cleanup complete"
