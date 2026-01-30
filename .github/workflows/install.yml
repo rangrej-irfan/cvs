@@ -426,7 +426,6 @@ jobs:
           
           echo "✅ Environment configuration created"
 
-      
       - name: Run installation script
         run: |
           echo "🚀 Setting up Privacera Manager..."
@@ -434,40 +433,6 @@ jobs:
           cd "${HOME}"
           
           CONFIG_FILE="gcp_pm_config_env.sh"
-          
-          # Create required directories that scripts expect
-          mkdir -p "${HOME}/privacera/privacera-manager/config/custom-vars/connectors"
-          
-          # Run installation (with Docker commands disabled)
-          echo "📦 Running installation script..."
-          
-          # Patch scripts to skip Docker commands if Docker isn't available
-          if ! docker info &> /dev/null 2>&1; then
-            echo "⚠️ Docker not available, patching scripts for Kubernetes-only deployment..."
-            
-            # Create a docker stub that warns but doesn't fail
-            mkdir -p "${HOME}/bin"
-            cat > "${HOME}/bin/docker" << 'DOCKERSTUB'
-          #!/bin/bash
-          echo "⚠️ Docker command skipped (not available on this runner): docker $*" >&2
-          # Return success for pull/login commands, fail for run commands
-          case "$1" in
-            pull|login|logout|tag|push)
-              echo "Skipping docker $1..."
-              exit 0
-              ;;
-            run)
-              echo "ERROR: Docker run not supported on this runner. Use Helm deployment instead." >&2
-              exit 1
-              ;;
-            *)
-              exit 0
-              ;;
-          esac
-          DOCKERSTUB
-            chmod +x "${HOME}/bin/docker"
-            export PATH="${HOME}/bin:$PATH"
-          fi
           
           # Run installation
           bash install_pm.sh "${CONFIG_FILE}" || {
@@ -489,139 +454,22 @@ jobs:
             fi
           }
           
-          # Create all required directories
-          echo "📁 Creating required directories..."
-          mkdir -p "${HOME}/privacera/privacera-manager/config/custom-vars/connectors"
-          mkdir -p "${HOME}/privacera/privacera-manager/config/custom-vars/ssl-certs"
-          mkdir -p "${HOME}/privacera/privacera-manager/output/kubernetes/helm"
-          
           # Use custom-vars from repo if available
           if [ -d "${GITHUB_WORKSPACE}/custom-vars" ] && [ -n "$(ls -A ${GITHUB_WORKSPACE}/custom-vars 2>/dev/null)" ]; then
             echo "📁 Using custom-vars from repository..."
-            cp -rv "${GITHUB_WORKSPACE}/custom-vars/"* "${HOME}/privacera/privacera-manager/config/custom-vars/" 2>/dev/null || true
-            # Ensure connectors directory exists after copy
-            mkdir -p "${HOME}/privacera/privacera-manager/config/custom-vars/connectors"
+            rm -rf "${HOME}/privacera/privacera-manager/config/custom-vars/"*
+            cp -rv "${GITHUB_WORKSPACE}/custom-vars/"* "${HOME}/privacera/privacera-manager/config/custom-vars/"
           else
             echo "📁 Using generated custom-vars..."
-            rm -f "${HOME}/privacera/privacera-manager/config/custom-vars/vars.privacera-secrets.yml" 2>/dev/null || true
-            rm -f "${HOME}/privacera/privacera-manager/config/custom-vars/vars.encrypt.secrets.yml" 2>/dev/null || true
+            rm -f "${HOME}/privacera/privacera-manager/config/custom-vars/vars.privacera-secrets.yml"
+            rm -f "${HOME}/privacera/privacera-manager/config/custom-vars/vars.encrypt.secrets.yml"
           fi
           
-          # Copy to workspace
+          # Copy to workspace for artifacts
           mkdir -p "${GITHUB_WORKSPACE}/privacera-manager"
           cp -rv "${HOME}/privacera/privacera-manager/"* "${GITHUB_WORKSPACE}/privacera-manager/"
           
           echo "✅ Privacera Manager setup complete"
-
-      - name: Generate Helm charts
-        run: |
-          echo "⎈ Generating Helm charts..."
-          cd "${GITHUB_WORKSPACE}/privacera-manager"
-          
-          # Ensure required directories exist
-          mkdir -p config/custom-vars/connectors
-          mkdir -p config/custom-vars/ssl-certs
-          mkdir -p output/kubernetes/helm
-          
-          # Create docker stub if Docker isn't available
-          if ! docker info &> /dev/null 2>&1; then
-            echo "⚠️ Docker not available, using Kubernetes-only mode..."
-            mkdir -p "${HOME}/bin"
-            cat > "${HOME}/bin/docker" << 'DOCKERSTUB'
-          #!/bin/bash
-          echo "⚠️ Skipping docker command: docker $*" >&2
-          exit 0
-          DOCKERSTUB
-            chmod +x "${HOME}/bin/docker"
-            export PATH="${HOME}/bin:$PATH"
-          fi
-          
-          # Run setup to generate Helm charts
-          ./privacera-manager.sh setup || {
-            echo "⚠️ Setup had warnings, checking if Helm charts were generated..."
-            if [ -d "output/kubernetes/helm" ] && [ -n "$(ls -A output/kubernetes/helm 2>/dev/null)" ]; then
-              echo "✅ Helm charts exist, continuing..."
-            else
-              echo "❌ No Helm charts generated"
-              exit 1
-            fi
-          }
-          
-          # Copy Helm charts
-          mkdir -p "${GITHUB_WORKSPACE}/helm-charts-output"
-          cp -rv output/kubernetes/helm/* "${GITHUB_WORKSPACE}/helm-charts-output/" 2>/dev/null || echo "⚠️ No Helm charts to copy"
-          
-          echo "✅ Helm charts generated"
-
-      - name: Deploy to Kubernetes
-        run: |
-          echo "🚀 Deploying to Kubernetes using Helm..."
-          cd "${GITHUB_WORKSPACE}/privacera-manager"
-          source "${GITHUB_WORKSPACE}/gcp_pm_config_env.sh"
-          
-          # Create docker stub if Docker isn't available
-          if ! docker info &> /dev/null 2>&1; then
-            echo "⚠️ Docker not available, using Helm-only deployment..."
-            mkdir -p "${HOME}/bin"
-            cat > "${HOME}/bin/docker" << 'DOCKERSTUB'
-          #!/bin/bash
-          echo "⚠️ Skipping docker command: docker $*" >&2
-          exit 0
-          DOCKERSTUB
-            chmod +x "${HOME}/bin/docker"
-            export PATH="${HOME}/bin:$PATH"
-          fi
-          
-          # Ensure the image pull secret exists in the namespace
-          echo "🔑 Ensuring image pull secret exists..."
-          kubectl create secret docker-registry privacera-registry-secret \
-            --namespace="${DEPLOYMENT_ENV_NAME}" \
-            --docker-server="${PRIVACERA_HUB_SERVER}" \
-            --docker-username="${{ secrets.PRIVACERA_HUB_USER }}" \
-            --docker-password="${{ secrets.PRIVACERA_HUB_PASSWORD }}" \
-            --dry-run=client -o yaml | kubectl apply -f - || true
-          
-          # Run Helm deployment
-          chmod +x ./pm_with_helm.sh
-          
-          echo "📦 Running Helm upgrade..."
-          ./pm_with_helm.sh upgrade || {
-            echo "⚠️ Upgrade had issues, trying install..."
-          }
-          
-          echo "📦 Running Helm install..."
-          ./pm_with_helm.sh install || {
-            echo "⚠️ Install had warnings, checking deployment status..."
-          }
-          
-          # Wait for LoadBalancer IPs
-          echo "⏳ Waiting for LoadBalancer services..."
-          PORTAL_IPS_FILE="${GITHUB_WORKSPACE}/portal-ips.txt"
-          : > "$PORTAL_IPS_FILE"  # Clear file
-          
-          for i in {1..30}; do
-            echo "  Attempt $i/30..."
-            kubectl -n "${DEPLOYMENT_ENV_NAME}" get svc -o jsonpath='{range .items[?(@.spec.type=="LoadBalancer")]}{.metadata.name}{"\t"}{.status.loadBalancer.ingress[0].ip}{"\n"}{end}' 2>/dev/null | while IFS=$'\t' read -r svc ip; do
-              if [ -n "$ip" ] && [ "$ip" != "<none>" ]; then
-                grep -q "^$svc:" "$PORTAL_IPS_FILE" || echo "$svc: $ip" >> "$PORTAL_IPS_FILE"
-              fi
-            done
-            
-            [ -s "$PORTAL_IPS_FILE" ] && break
-            sleep 10
-          done
-          
-          # Show service URLs if available
-          if [ -f "output/service-urls.txt" ]; then
-            echo "📋 Service URLs:"
-            cat output/service-urls.txt
-          fi
-          
-          # Run post-install (skip if it needs Docker)
-          echo "🔧 Running post-install steps..."
-          ./privacera-manager.sh post-install || echo "⚠️ Post-install had warnings"
-          
-          echo "✅ Kubernetes deployment completed"
 
       - name: Generate Helm charts
         run: |
