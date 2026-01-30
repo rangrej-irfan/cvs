@@ -575,3 +575,17 @@ jobs:
           rm -f "${GCP_KEY_FILE}" 2>/dev/null || true
           rm -f "${RUNNER_TEMP}/gcp-service-account-key.json" 2>/dev/null || true
           echo "🧹 Cleanup complete"
+
+      - name: Fix workspace permissions
+        if: always()
+        run: |
+          echo "🔧 Fixing workspace permissions for next run..."
+          
+          # Change ownership of all files to the runner user
+          sudo chown -R $(whoami):$(whoami) "${GITHUB_WORKSPACE}" 2>/dev/null || true
+          sudo chown -R $(whoami):$(whoami) "${HOME}/privacera" 2>/dev/null || true
+          
+          # Make sure files are readable/writable
+          chmod -R u+rw "${GITHUB_WORKSPACE}" 2>/dev/null || true
+          
+          echo "✅ Permissions fixed"
