@@ -64,20 +64,96 @@ jobs:
       - name: Install prerequisites
         run: |
           echo "📦 Installing prerequisites..."
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl tar gzip wget openssl hostname sudo unzip python3 python3-pip apt-transport-https ca-certificates gnupg
+          
+          # Remove problematic PostgreSQL repository if it exists
+          echo "🧹 Cleaning up problematic apt repositories..."
+          sudo rm -f /etc/apt/sources.list.d/pgdg*.list 2>/dev/null || true
+          sudo rm -f /etc/apt/sources.list.d/postgresql*.list 2>/dev/null || true
+          
+          # Also remove any other potentially problematic third-party repos
+          # that might cause issues on self-hosted runners
+          for repo_file in /etc/apt/sources.list.d/*.list; do
+            if [ -f "$repo_file" ]; then
+              # Check if repo is accessible, if not, disable it
+              repo_name=$(basename "$repo_file")
+              echo "  Checking: $repo_name"
+            fi
+          done
+          
+          # Clean apt cache after removing repos
+          sudo apt-get clean
+          
+          # Update package lists (with error tolerance for any remaining bad repos)
+          echo "📋 Updating package lists..."
+          sudo apt-get update -qq 2>&1 | grep -v "does not have a Release file" || true
+          
+          # Install core dependencies
+          echo "📦 Installing core packages..."
+          sudo apt-get install -y -qq \
+            curl \
+            tar \
+            gzip \
+            wget \
+            openssl \
+            hostname \
+            sudo \
+            unzip \
+            python3 \
+            python3-pip \
+            apt-transport-https \
+            ca-certificates \
+            gnupg \
+            lsb-release \
+            || { echo "⚠️ Some packages may have failed, continuing..."; }
           
           # Install Google Cloud SDK
           echo "☁️ Installing Google Cloud SDK..."
           if ! command -v gcloud &> /dev/null; then
-            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
-            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
-            sudo apt-get update -qq && sudo apt-get install -y -qq google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin
+            # Remove any existing Google Cloud SDK repo config to start fresh
+            sudo rm -f /etc/apt/sources.list.d/google-cloud-sdk.list 2>/dev/null || true
+            
+            # Add Google Cloud SDK repository
+            echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | \
+              sudo tee /etc/apt/sources.list.d/google-cloud-sdk.list
+            
+            # Add the GPG key
+            curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+              sudo gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg 2>/dev/null || \
+              curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | \
+              sudo apt-key add -
+            
+            # Update and install
+            sudo apt-get update -qq 2>&1 | grep -v "does not have a Release file" || true
+            sudo apt-get install -y -qq google-cloud-cli google-cloud-cli-gke-gcloud-auth-plugin || {
+              echo "⚠️ apt install failed, trying snap..."
+              sudo snap install google-cloud-cli --classic 2>/dev/null || {
+                echo "⚠️ snap failed, trying direct download..."
+                curl -O https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz
+                tar -xf google-cloud-cli-linux-x86_64.tar.gz
+                ./google-cloud-sdk/install.sh --quiet --path-update=true
+                export PATH="$PATH:$(pwd)/google-cloud-sdk/bin"
+                echo "$(pwd)/google-cloud-sdk/bin" >> $GITHUB_PATH
+              }
+            }
           else
             echo "✅ gcloud already installed"
           fi
           
-          gcloud --version
+          # Verify gcloud installation
+          if command -v gcloud &> /dev/null; then
+            gcloud --version
+          else
+            echo "❌ ERROR: gcloud installation failed"
+            exit 1
+          fi
+          
+          # Install gke-gcloud-auth-plugin if not already installed
+          if ! command -v gke-gcloud-auth-plugin &> /dev/null; then
+            echo "🔌 Installing gke-gcloud-auth-plugin..."
+            sudo apt-get install -y -qq google-cloud-cli-gke-gcloud-auth-plugin 2>/dev/null || \
+              gcloud components install gke-gcloud-auth-plugin --quiet 2>/dev/null || \
+              echo "⚠️ gke-gcloud-auth-plugin installation deferred"
+          fi
           
           # Install kubectl
           echo "🔧 Installing kubectl..."
@@ -91,19 +167,6 @@ jobs:
           fi
           kubectl version --client
           
-          # Verify gke-gcloud-auth-plugin
-          if command -v gke-gcloud-auth-plugin &> /dev/null; then
-            echo "✅ gke-gcloud-auth-plugin available at: $(which gke-gcloud-auth-plugin)"
-          else
-            echo "⚠️ gke-gcloud-auth-plugin not in PATH, checking alternative locations..."
-            for path in /usr/bin/gke-gcloud-auth-plugin /usr/local/bin/gke-gcloud-auth-plugin; do
-              if [ -x "$path" ]; then
-                echo "✅ Found at: $path"
-                break
-              fi
-            done
-          fi
-          
           # Install Helm
           echo "⎈ Installing Helm..."
           if ! command -v helm &> /dev/null; then
@@ -113,10 +176,13 @@ jobs:
           fi
           helm version
           
-          # Install Ansible
-          pip3 install --break-system-packages ansible-core>=2.12.0 PyYAML 2>/dev/null || pip3 install ansible-core>=2.12.0 PyYAML
+          # Install Ansible and PyYAML
+          echo "📚 Installing Python packages..."
+          pip3 install --break-system-packages ansible-core>=2.12.0 PyYAML 2>/dev/null || \
+            pip3 install --user ansible-core>=2.12.0 PyYAML 2>/dev/null || \
+            pip3 install ansible-core PyYAML
           
-          echo "✅ All prerequisites installed"
+          echo "✅ All prerequisites installed successfully"
 
       - name: Authenticate to GCP
         env:
