@@ -326,11 +326,52 @@ jobs:
           echo "===================================="
 
       - name: Login to Privacera Hub
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.PRIVACERA_HUB_SERVER }}
-          username: ${{ secrets.PRIVACERA_HUB_USER }}
-          password: ${{ secrets.PRIVACERA_HUB_PASSWORD }}
+        env:
+          PRIVACERA_HUB_USER: ${{ secrets.PRIVACERA_HUB_USER }}
+          PRIVACERA_HUB_PASSWORD: ${{ secrets.PRIVACERA_HUB_PASSWORD }}
+        run: |
+          echo "🔐 Setting up Privacera Hub registry access..."
+          
+          REGISTRY="${PRIVACERA_HUB_SERVER}"
+          
+          # Method 1: Try Docker if available
+          if command -v docker &> /dev/null; then
+            if docker info &> /dev/null 2>&1; then
+              echo "Using Docker for registry login..."
+              echo "${PRIVACERA_HUB_PASSWORD}" | docker login "${REGISTRY}" -u "${PRIVACERA_HUB_USER}" --password-stdin
+              echo "✅ Docker login successful"
+            else
+              echo "⚠️ Docker available but daemon not accessible"
+            fi
+          fi
+          
+          # Method 2: Create docker config.json (works without Docker daemon)
+          echo "📝 Creating Docker config.json..."
+          mkdir -p ~/.docker
+          AUTH=$(echo -n "${PRIVACERA_HUB_USER}:${PRIVACERA_HUB_PASSWORD}" | base64 -w 0 2>/dev/null || echo -n "${PRIVACERA_HUB_USER}:${PRIVACERA_HUB_PASSWORD}" | base64)
+          
+          cat > ~/.docker/config.json << EOF
+          {
+            "auths": {
+              "${REGISTRY}": {
+                "auth": "${AUTH}"
+              }
+            }
+          }
+          EOF
+          chmod 600 ~/.docker/config.json
+          echo "✅ Docker config.json created"
+          
+          # Method 3: Create Kubernetes image pull secret
+          echo "🔑 Creating Kubernetes image pull secret..."
+          kubectl create secret docker-registry privacera-registry-secret \
+            --namespace="${DEPLOYMENT_ENV_NAME}" \
+            --docker-server="${REGISTRY}" \
+            --docker-username="${PRIVACERA_HUB_USER}" \
+            --docker-password="${PRIVACERA_HUB_PASSWORD}" \
+            --dry-run=client -o yaml | kubectl apply -f - || echo "⚠️ Could not create K8s secret (may already exist)"
+          
+          echo "✅ Registry credentials configured"
 
       - name: Create namespace
         run: |
