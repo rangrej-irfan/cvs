@@ -504,8 +504,7 @@ jobs:
           source "${GITHUB_WORKSPACE}/gcp_pm_config_env.sh"
           
           chmod +x ./pm_with_helm.sh
-          ./pm_with_helm.sh upgrade
-          ./privacera-manager.sh setup && ./pm_with_helm.sh install
+          ./pm_with_helm.sh install
           
           # Wait for LoadBalancer IPs
           echo "⏳ Waiting for LoadBalancer services..."
