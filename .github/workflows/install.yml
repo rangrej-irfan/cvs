@@ -529,11 +529,71 @@ jobs:
       - name: Generate Helm charts
         run: |
           echo "⎈ Generating Helm charts..."
-          cd "${GITHUB_WORKSPACE}/privacera-manager"
+          
+          # The privacera-manager is installed in HOME/privacera/privacera-manager
+          # In the install step, HOME was set to GITHUB_WORKSPACE
+          PM_HOME="${GITHUB_WORKSPACE}/privacera/privacera-manager"
+          
+          # Fallback: check alternative locations
+          if [ ! -d "$PM_HOME" ]; then
+            echo "⚠️ Not found at $PM_HOME, checking alternatives..."
+            
+            if [ -d "${HOME}/privacera/privacera-manager" ]; then
+              PM_HOME="${HOME}/privacera/privacera-manager"
+            elif [ -d "${GITHUB_WORKSPACE}/privacera-manager" ]; then
+              PM_HOME="${GITHUB_WORKSPACE}/privacera-manager"
+            else
+              echo "❌ ERROR: Cannot find privacera-manager directory"
+              echo ""
+              echo "📁 Searching for privacera-manager.sh..."
+              find "${GITHUB_WORKSPACE}" "${HOME}" -name "privacera-manager.sh" -type f 2>/dev/null
+              exit 1
+            fi
+          fi
+          
+          echo "📍 Using privacera-manager at: $PM_HOME"
+          cd "$PM_HOME"
+          
+          # Debug: Show contents
+          echo "📁 Directory contents:"
+          ls -la
+          
+          # Ensure script is executable
+          if [ ! -f "./privacera-manager.sh" ]; then
+            echo "❌ ERROR: privacera-manager.sh not found in $PM_HOME"
+            exit 1
+          fi
+          
+          chmod +x ./privacera-manager.sh
+          
+          # Run setup
+          echo ""
+          echo "🔧 Running privacera-manager.sh setup..."
           ./privacera-manager.sh setup
           
+          # Check if helm charts were generated
+          echo ""
+          echo "📁 Checking for generated helm charts..."
+          if [ -d "output/kubernetes/helm" ]; then
+            echo "✅ Helm charts found at: $PM_HOME/output/kubernetes/helm"
+            ls -la output/kubernetes/helm/
+          else
+            echo "⚠️ Helm output directory not found, checking alternatives..."
+            find . -type d -name "helm" 2>/dev/null
+          fi
+          
+          # Copy to workspace for artifacts
           mkdir -p "${GITHUB_WORKSPACE}/helm-charts-output"
           cp -rv output/kubernetes/helm/* "${GITHUB_WORKSPACE}/helm-charts-output/" 2>/dev/null || echo "⚠️ No helm charts to copy"
+          
+          # Also copy the entire privacera-manager to workspace for later steps
+          echo ""
+          echo "📦 Copying privacera-manager to workspace..."
+          mkdir -p "${GITHUB_WORKSPACE}/privacera-manager"
+          cp -rv "$PM_HOME/"* "${GITHUB_WORKSPACE}/privacera-manager/" 2>/dev/null || true
+          
+          # Export the path for subsequent steps
+          echo "PM_HOME=$PM_HOME" >> $GITHUB_ENV
           
           echo "✅ Helm charts generated"
 
@@ -555,11 +615,32 @@ jobs:
       - name: Deploy to Kubernetes
         run: |
           echo "🚀 Deploying to Kubernetes..."
-          cd "${GITHUB_WORKSPACE}/privacera-manager"
           source "${GITHUB_WORKSPACE}/gcp_pm_config_env.sh"
           
-          chmod +x ./pm_with_helm.sh
-          ./pm_with_helm.sh install
+          # Use PM_HOME from previous step, or find it
+          if [ -z "$PM_HOME" ] || [ ! -d "$PM_HOME" ]; then
+            PM_HOME="${GITHUB_WORKSPACE}/privacera/privacera-manager"
+            [ ! -d "$PM_HOME" ] && PM_HOME="${GITHUB_WORKSPACE}/privacera-manager"
+            [ ! -d "$PM_HOME" ] && PM_HOME="${HOME}/privacera/privacera-manager"
+          fi
+          
+          echo "📍 Using privacera-manager at: $PM_HOME"
+          cd "$PM_HOME"
+          
+          # Check for pm_with_helm.sh or use privacera-manager.sh
+          if [ -f "./pm_with_helm.sh" ]; then
+            chmod +x ./pm_with_helm.sh
+            echo "🚀 Running pm_with_helm.sh install..."
+            ./pm_with_helm.sh install
+          elif [ -f "./privacera-manager.sh" ]; then
+            chmod +x ./privacera-manager.sh
+            echo "🚀 Running privacera-manager.sh install..."
+            ./privacera-manager.sh install
+          else
+            echo "❌ ERROR: No installation script found"
+            ls -la
+            exit 1
+          fi
           
           # Wait for LoadBalancer IPs
           echo "⏳ Waiting for LoadBalancer services..."
@@ -577,7 +658,10 @@ jobs:
           # Display service URLs
           cat output/service-urls.txt 2>/dev/null || echo "⚠️ service-urls.txt not found"
           
-          ./privacera-manager.sh post-install
+          # Run post-install
+          if [ -f "./privacera-manager.sh" ]; then
+            ./privacera-manager.sh post-install
+          fi
           
           echo "✅ Deployment completed"
 
