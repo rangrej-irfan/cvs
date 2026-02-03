@@ -30,6 +30,11 @@ on:
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+# Required for Workload Identity Federation
+permissions:
+  contents: read
+  id-token: write  # Required to request OIDC token
+
 jobs:
   install:
     name: Install Privacera Manager
@@ -75,7 +80,6 @@ jobs:
           sudo chown -R $(whoami):$(whoami) "${GITHUB_WORKSPACE}" 2>/dev/null || true
           
           echo "✅ Cleanup complete"
-
 
       - name: Check workflow_dispatch event
         run: |
@@ -208,16 +212,42 @@ jobs:
           
           echo "✅ All prerequisites installed successfully"
 
-      - name: Authenticate to GCP
+      # ============================================
+      # WORKLOAD IDENTITY FEDERATION AUTHENTICATION
+      # ============================================
+      - name: Authenticate to GCP using Workload Identity Federation
         id: auth
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          # Optional: Export credentials to environment for tools that need them
+          export_environment_variables: true
+          # Optional: Create credentials file for tools that need file-based auth
+          create_credentials_file: true
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
         with:
           install_components: 'gke-gcloud-auth-plugin'
+
+      - name: Verify GCP Authentication
+        run: |
+          echo "🔍 Verifying GCP authentication..."
+          
+          # Check authenticated account
+          gcloud auth list
+          
+          # Verify project access
+          echo ""
+          echo "📋 Checking project access..."
+          gcloud projects describe "${GCP_PROJECT_ID}" --format="value(name)" || {
+            echo "❌ ERROR: Cannot access project ${GCP_PROJECT_ID}"
+            echo "Verify the service account has appropriate permissions"
+            exit 1
+          }
+          
+          echo "✅ GCP authentication successful via Workload Identity Federation"
 
       - name: Load configuration from variables.env
         run: |
@@ -347,6 +377,7 @@ jobs:
           echo "Privacera Hub Server: ${PRIVACERA_HUB_SERVER}"
           echo "Debug Mode: ${DEBUG_MODE}"
           echo "Skip Helm Validation: ${SKIP_HELM_VALIDATION}"
+          echo "Authentication: Workload Identity Federation"
           echo "===================================="
 
       - name: Login to Privacera Hub
@@ -573,6 +604,7 @@ jobs:
           echo "Region/Zone: ${GCP_REGION}"
           echo "Cluster: ${GKE_CLUSTER_NAME}"
           echo "Privacera Version: ${PRIVACERA_VERSION}"
+          echo "Authentication: Workload Identity Federation"
           echo "========================================"
           echo ""
           
@@ -591,14 +623,6 @@ jobs:
           echo ""
           
           echo "✅ Deployment complete!"
-
-      - name: Cleanup sensitive files
-        if: always()
-        run: |
-          # Remove the temporary key file
-          rm -f "${GCP_KEY_FILE}" 2>/dev/null || true
-          rm -f "${RUNNER_TEMP}/gcp-service-account-key.json" 2>/dev/null || true
-          echo "🧹 Cleanup complete"
 
       - name: Fix workspace permissions
         if: always()
