@@ -526,7 +526,7 @@ jobs:
           echo "🚀 Deploying to Kubernetes..."
           cd "${GITHUB_WORKSPACE}/privacera-manager"
           source "${GITHUB_WORKSPACE}/gcp_pm_config_env.sh"
-          
+          ./privacera-manager.sh setup
           chmod +x ./pm_with_helm.sh
           ./pm_with_helm.sh install
           
